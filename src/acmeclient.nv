@@ -1,0 +1,291 @@
+// acmeclient.nv — the half that talks to the certificate authority.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW, and it is
+// `[io, net, time, async]` — which is `std.http`'s `HttpClient.send`
+// row and not a choice made here.  `[async]` because the transport
+// parks on the socket, `[time]` because the deadline is read from a
+// clock, `[io]` because that is what the connection surface under it
+// declares.  An ACME client that used the narrower `?Str` one-shots
+// would not see a response header, and an ACME client that cannot read
+// `Replay-Nonce` and `Location` cannot register an account, cannot find
+// its order's URL, and cannot make a second request.  So the row is
+// what it is, and the README records it as a place the plan's row
+// wanted to widen.
+//
+// EVERY REQUEST IS A POST, INCLUDING EVERY READ.  RFC 8555 § 6.3
+// replaced GET with POST-as-GET: a signed POST whose payload is zero
+// bytes.  A client that sent a GET to an order or an authorization URL
+// gets 405 from every production server, and the failure names the
+// method rather than the design mistake.  `post_as_get` is the read
+// and `post` is the write, and there is no `get` on this page at all.
+//
+// A `badNonce` IS RETRIED HERE, ONCE, AUTOMATICALLY.  RFC 8555 § 6.5
+// requires the retry, servers under load hand the error out routinely,
+// and a client that surfaced it fails intermittently in a way that
+// looks like the network.  `post` retries with the nonce from the very
+// reply that refused it; a second `badNonce` is surfaced, because two
+// in a row is a clock or a client that is not following the protocol.
+//
+// EVERY EXCHANGE ANSWERS THE NEXT NONCE, AND THAT IS WHY THERE IS AN
+// `AcmeExchange` RATHER THAN A REPLY.  The nonce is single-use — see
+// `acmejws` — so an exchange that answered only the reply would leave
+// the caller with nothing to sign the next request with, and a client
+// that kept one in a field would reuse it.  Threading it out through
+// the answer is what makes a reuse something a reader can see.
+//
+// NOTHING HERE POLLS ON ITS OWN AND NOTHING HERE SLEEPS.
+// `poll_order`, `poll_authorization` and `poll_challenge` each perform
+// ONE request and answer what they found; the loop, the backoff and
+// the deadline are the caller's, with `acmerenew.poll_backoff_seconds`
+// as the schedule.  A library that ran its own loop would own a
+// timeout policy for a process it knows nothing about, and would hide
+// the one thing an operator watching an issuance wants to see.
+
+use acmemsg
+
+// The public directory URL of the free certificate authority most
+// callers mean.
+pub fn letsencrypt_directory_url() -> Str []
+    todo("acme-nv.acmeclient.letsencrypt_directory_url")
+
+// The staging directory: real protocol, untrusted certificates, and
+// rate limits wide enough to develop against.
+//
+// Named beside the production one on purpose.  Every rate limit a
+// first-time user runs into is one they would not have hit here.
+pub fn letsencrypt_staging_directory_url() -> Str []
+    todo("acme-nv.acmeclient.letsencrypt_staging_directory_url")
+
+// How a client signs, and who it says it is.
+//
+// The signing function is an argument for the reason `acmejws` gives:
+// there is no ECDSA signer on this grid.  A named function, so it
+// survives a device build.
+pub struct AcmeSigner
+    alg: JwtAlg
+    // RFC 7638 canonical JWK for the account key.  One copy, used for
+    // the protected header and for every thumbprint, so the two cannot
+    // disagree.
+    jwk_json: Str
+    sign: fn(Bytes) -> ?Bytes
+
+// A client session: where the server is, who we are, and the one
+// unused nonce we hold.
+pub struct AcmeSession
+    directory: AcmeDirectory
+    signer: AcmeSigner
+    // Empty until an account has been registered; the `kid` every
+    // request after that is signed with.
+    account_url: Str
+    timeout_ms: Int
+    // A user agent string, which a certificate authority will ask for
+    // when something goes wrong at scale.
+    user_agent: Str
+
+// One exchange: what the server said, and the nonce for the next
+// request.
+//
+// The nonce is in the answer rather than in a field, because it is
+// single-use and a value that is threaded cannot be quietly reused.
+pub struct AcmeExchange
+    status: Int
+    body: Str
+    // From the `Location` header — an account's URL, an order's URL.
+    location: Str
+    // From `Retry-After`, in seconds; 0 when the header was absent.
+    retry_after: Int
+    // The `Link: <...>;rel="up"` header, which is how a certificate
+    // download offers alternate chains.
+    link_up: Str
+    next_nonce: AcmeNonce
+
+// What can go wrong talking to a certificate authority.
+pub enum AcmeClientFault
+    // The request never reached the server.
+    AcmeClientTransportFailed(detail: Str)
+    // A reply with no `Replay-Nonce`, which leaves the session with
+    // nothing to sign the next request with.  Named separately because
+    // it is a server fault and the recovery is different: fetch a fresh
+    // nonce rather than retry.
+    AcmeClientNoNonce(url: Str)
+    // A newAccount or newOrder reply with no `Location` header, so the
+    // object has no URL.
+    AcmeClientNoLocation(url: Str)
+    // The server answered a problem document.
+    AcmeClientProblem(problem: AcmeProblem)
+    // A status this package does not expect for the request it made.
+    AcmeClientUnexpectedStatus(url: Str, status: Int)
+    // A second `badNonce` for the same request.  Once is the protocol;
+    // twice is a clock skew or a client bug, and it is surfaced.
+    AcmeClientNonceRetryExhausted(url: Str)
+    // A message could not be read.
+    AcmeClientBadMessage(fault: AcmeMsgFault)
+    // A request could not be signed.
+    AcmeClientBadSignature(fault: AcmeJwsFault)
+    // A request made before the account was registered, which has no
+    // `kid` to sign with.
+    AcmeClientNoAccount
+
+// A signer from an algorithm, a canonical JWK and a signing function.
+pub fn signer(alg: JwtAlg, jwk_json: Str, sign: fn(Bytes) -> ?Bytes) -> AcmeSigner []
+    todo("acme-nv.acmeclient.signer")
+
+// Fetch the directory and open a session.
+pub fn session(directory_url: Str,
+               s: AcmeSigner) -> Result<AcmeSession, AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.session")
+
+// A session with a different request deadline.
+pub fn with_timeout(s: AcmeSession, ms: Int) -> AcmeSession []
+    todo("acme-nv.acmeclient.with_timeout")
+
+// A session that identifies itself, which a certificate authority will
+// ask for when something goes wrong at scale.
+pub fn with_user_agent(s: AcmeSession, ua: Str) -> AcmeSession []
+    todo("acme-nv.acmeclient.with_user_agent")
+
+// Fetch a fresh nonce.
+//
+// A HEAD to the newNonce URL, which is the one request in the protocol
+// that is not a signed POST.
+pub fn fresh_nonce(s: AcmeSession) -> Result<AcmeNonce, AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.fresh_nonce")
+
+// One signed POST, retrying once on `badNonce`.
+//
+// The nonce goes in and the next one comes out inside the exchange.
+pub fn post(s: AcmeSession, n: AcmeNonce, url: Str, key: AcmeJwsKeyId,
+            payload_json: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.post")
+
+// One POST-as-GET: a signed POST with an empty payload, which is how
+// every read in this protocol is done.
+pub fn post_as_get(s: AcmeSession, n: AcmeNonce,
+                   url: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.post_as_get")
+
+// Register an account, or find the existing one for this key.
+//
+// Signed with `jwk` and not `kid`, because there is no account URL yet
+// — that is what this request produces, and it arrives in the
+// `Location` header.
+pub fn new_account(s: AcmeSession, n: AcmeNonce, contact: [Str],
+                   terms_agreed: Bool) -> Result<(AcmeSession, AcmeAccount, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.new_account")
+
+// Find the account for this key WITHOUT creating one.
+//
+// `onlyReturnExisting`, which answers `accountDoesNotExist` rather than
+// registering.  What a program that expects to have an account already
+// should use, so a lost key is an error rather than a silent second
+// account with no orders in it.
+pub fn find_account(s: AcmeSession,
+                    n: AcmeNonce) -> Result<(AcmeSession, AcmeAccount, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.find_account")
+
+// Create an order for a set of names.
+pub fn new_order(s: AcmeSession, n: AcmeNonce,
+                 identifiers: [AcmeIdentifier]) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.new_order")
+
+// Read an authorization.
+pub fn authorization(s: AcmeSession, n: AcmeNonce,
+                     url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.authorization")
+
+// Tell the server a challenge is ready to be checked.
+//
+// The payload is `{}` and not an empty one — see
+// `acmemsg.write_challenge_ready`.  The caller must have published the
+// challenge value BEFORE this call, because the server may check
+// immediately.
+pub fn challenge_ready(s: AcmeSession, n: AcmeNonce,
+                       challenge_url: Str) -> Result<(AcmeChallenge, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.challenge_ready")
+
+// Read a challenge once.  The loop is the caller's.
+pub fn poll_challenge(s: AcmeSession, n: AcmeNonce,
+                      challenge_url: Str) -> Result<(AcmeChallenge, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.poll_challenge")
+
+// Read an authorization once.  The loop is the caller's.
+pub fn poll_authorization(s: AcmeSession, n: AcmeNonce,
+                          url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.poll_authorization")
+
+// Read an order once.  The loop is the caller's.
+pub fn poll_order(s: AcmeSession, n: AcmeNonce,
+                  url: Str) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.poll_order")
+
+// Finalise an order with a certification request.
+//
+// Check `acmecsr.names_match` first.  A finalise the server refuses
+// makes the ORDER invalid, and an invalid order cannot be retried — the
+// whole issuance starts again, challenges included.
+pub fn finalize(s: AcmeSession, n: AcmeNonce, finalize_url: Str,
+                csr_der: Bytes) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.finalize")
+
+// Download the issued certificate chain as PEM.
+//
+// A POST-as-GET like every other read.  The reply's `Link` header with
+// `rel="alternate"` offers other chains — a shorter one, or one rooted
+// differently — and `download_alternate` is how a caller takes one.
+pub fn download_certificate(s: AcmeSession, n: AcmeNonce,
+                            certificate_url: Str) -> Result<(Str, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.download_certificate")
+
+// The alternate chain URLs a certificate download offered.
+pub fn alternate_chains(x: AcmeExchange) -> [Str] []
+    todo("acme-nv.acmeclient.alternate_chains")
+
+// Revoke a certificate, signed with the account key.
+pub fn revoke(s: AcmeSession, n: AcmeNonce, certificate_der: Bytes,
+              reason: Int) -> Result<AcmeNonce, AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.revoke")
+
+// Deactivate an authorization, so a later order for the name has to
+// prove control again.
+//
+// What to run when a name stops being yours: a valid authorization is
+// cached by the server for weeks, and until it is deactivated the
+// account can order a certificate for a name it no longer controls.
+pub fn deactivate_authorization(s: AcmeSession, n: AcmeNonce,
+                                url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    todo("acme-nv.acmeclient.deactivate_authorization")
+
+// The wall clock, UTC, for a caller planning a renewal.
+//
+// The one function in the package that reads a clock for its own sake
+// — the `[time]` in every row above is `std.http`'s deadline rather
+// than this.
+pub fn now_civil() -> CivilDateTime [time]
+    todo("acme-nv.acmeclient.now_civil")
+
+// Whether an exchange carried a problem document rather than an
+// object.
+pub fn is_problem(x: AcmeExchange) -> Bool []
+    todo("acme-nv.acmeclient.is_problem")
+
+// The problem an exchange carried.
+pub fn problem_of(x: AcmeExchange) -> Result<AcmeProblem, AcmeClientFault> []
+    todo("acme-nv.acmeclient.problem_of")
+
+// What went wrong talking to the certificate authority, in one line.
+//
+// A problem document renders as its `detail`, because that is the
+// sentence the server wrote for a person to read, and everything a
+// client could add to it is noise.
+//
+// ```novo ignore
+// use acmeclient
+//
+// fn report(e: AcmeClientFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeClientFault
+    fn message(self) -> Str
+        todo("acme-nv.acmeclient.AcmeClientFault.message")

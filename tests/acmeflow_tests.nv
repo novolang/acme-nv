@@ -1,0 +1,536 @@
+// acmeflow_tests.nv — the message shapes, the JWS, the two challenges,
+// the certificate request and the renewal arithmetic.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: acme-nv.<module>.<fn>`.
+//
+// NO NETWORK IN THIS FILE.  Five of the six modules are `[]`
+// throughout, so a whole issuance conversation is a sequence of JSON
+// documents a test writes out.
+
+use std.test
+use std.bytes
+use std.list
+use acmemsg
+use acmejws
+use acmechal
+use acmecsr
+use acmerenew
+use civil
+use p256
+
+fn at(y: Int, m: Int, d: Int) -> CivilDateTime
+    match civil.date(y, m, d)
+        Ok(dd) => civil.datetime(dd, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn refuse_to_sign(input: Bytes) -> ?Bytes
+    None
+
+fn a_jwk() -> Str
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"BBBB\"}"
+
+@test
+fn test_bad_nonce_is_a_retry_and_not_a_failure() [io]
+    // RFC 8555 § 6.5: a client that receives one MUST retry the same
+    // request with the nonce from that very reply.  Servers under load
+    // hand them out routinely, so a client that surfaced it fails
+    // intermittently in a way that looks like the network.
+    let body = "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"JWS has an invalid anti-replay nonce\",\"status\":400}"
+    match acmemsg.parse_problem(body, acmemsg.default_limits())
+        Err(_) => test.fail("that is a well-formed problem document")
+        Ok(p)  =>
+            test.case("it is recognised as the retry it is")
+            test.assert(acmemsg.problem_is_bad_nonce(p))
+
+            test.case("and not as a rate limit or a failed challenge")
+            test.assert(not acmemsg.problem_is_rate_limit(p))
+            test.assert(not acmemsg.problem_is_challenge_failure(p))
+
+            test.case("the URN is what a client branches on, not the status")
+            test.assert_eq(acmemsg.problem_kind(p), "urn:ietf:params:acme:error:badNonce")
+
+@test
+fn test_a_nonce_is_consumed_by_one_request() [io]
+    // The single-use rule is the type: `protected_header` takes a nonce
+    // by value and an exchange answers the next one, so a caller that
+    // wanted to send two requests with one has to write code that
+    // visibly reuses a value.
+    let n = acmejws.nonce("oFvnlFP1wIhRlYS2jTaXbA")
+    test.case("a nonce carries its text for a log and nothing else")
+    test.assert_eq(acmejws.nonce_value(n), "oFvnlFP1wIhRlYS2jTaXbA")
+
+    test.case("and the protected header consumes it")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-order",
+                                   AcmeJwsKid("https://example.com/acme/acct/1"))
+        Ok(h)  => test.assert(str.contains(h, "nonce"))
+        Err(_) => test.fail("a kid header for a new-order is the ordinary case")
+
+@test
+fn test_the_key_is_named_one_way_or_the_other_and_never_both() [io]
+    // RFC 8555 § 6.2: newAccount carries the full public key as `jwk`;
+    // every other request carries the account URL as `kid`.  A header
+    // with both is refused by the server, so the type has two cases and
+    // no way to express both.
+    let n = acmejws.nonce("nonce")
+
+    test.case("a kid where the request wants a jwk is refused here")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-acct",
+                                   AcmeJwsKid("https://example.com/acme/acct/1"))
+        Ok(_)  => test.fail("newAccount is signed with the key itself")
+        Err(e) =>
+            match e
+                AcmeJwsWrongKeyId(_, _) => test.assert(true)
+                _                       => test.fail("the fault names the request and what it wanted")
+
+@test
+fn test_the_thumbprint_is_a_digest_of_a_canonical_string() [io]
+    // RFC 7638: only the required members, lexicographic order, no
+    // whitespace.  One extra member or one space produces a different
+    // thumbprint, a different key authorization, and a challenge that
+    // fails with a message about the response not matching.
+    test.case("the canonical form has four members and no spaces")
+    match acmejws.thumbprint_text(a_jwk())
+        Ok(t)  => test.assert(str.len(t) > 0)
+        Err(_) => test.fail("that is canonical form")
+
+    test.case("and a JWK with a member out of order is refused rather than hashed")
+    match acmejws.thumbprint_text("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AAAA\",\"y\":\"BBBB\"}")
+        Ok(_)  => test.fail("the member order is part of the construction")
+        Err(e) =>
+            match e
+                AcmeJwsJwkNotCanonical(_) => test.assert(true)
+                _                         => test.fail("the fault says the JWK is not canonical")
+
+@test
+fn test_a_read_has_an_empty_payload_and_not_an_empty_object() [io]
+    // RFC 8555 § 6.3 replaced GET with POST-as-GET: a signed POST whose
+    // payload is zero bytes.  `{}` is a different request — on a
+    // challenge URL it means "start validating" — so a client that sent
+    // the wrong one polls a challenge the server was never asked to
+    // check.
+    test.case("a read sends nothing at all")
+    test.assert_eq(acmejws.post_as_get_payload(), "")
+
+    test.case("and telling the server a challenge is ready sends an empty object")
+    test.assert_eq(acmemsg.write_challenge_ready(), "{}")
+
+@test
+fn test_base64url_carries_no_padding() [io]
+    // RFC 7515 § 2 strips the `=`.  A client that sent standard base64
+    // has its signature refused with a message that says nothing about
+    // the encoding.
+    test.case("one byte encodes to two characters, not four")
+    test.assert_eq(str.len(acmejws.base64url(bytes.zeros(1))), 2)
+
+    test.case("and it decodes back")
+    match acmejws.base64url_decode(acmejws.base64url(bytes.from_str("abc")))
+        Ok(b)  => test.assert_eq(bytes.len(b), 3)
+        Err(_) => test.fail("what it encoded, it decodes")
+
+@test
+fn test_an_authorization_for_a_wildcard_carries_the_base_name() [io]
+    // The order's identifier is `*.example.com`; the authorization's is
+    // `example.com` with `wildcard: true` beside it.  A client that
+    // matched them by string never finds the one it is looking for.
+    test.case("the identifier knows it is a wildcard")
+    let star = acmemsg.dns_identifier("*.example.com")
+    test.assert(acmemsg.is_wildcard(star))
+
+    test.case("and its base name is what the authorization will carry")
+    test.assert_eq(acmemsg.base_name(star), "example.com")
+
+    test.case("a plain name is its own base name")
+    test.assert_eq(acmemsg.base_name(acmemsg.dns_identifier("example.com")), "example.com")
+
+@test
+fn test_only_dns01_can_answer_a_wildcard() [io]
+    // A client that offered HTTP-01 for a wildcard has told the server
+    // to fetch a file from a host the wildcard does not name.
+    let star = acmemsg.dns_identifier("*.example.com")
+    let plain = acmemsg.dns_identifier("example.com")
+
+    test.case("DNS-01 answers a wildcard")
+    test.assert(acmechal.kind_can_answer(AcmeDns01, star))
+
+    test.case("HTTP-01 does not")
+    test.assert(not acmechal.kind_can_answer(AcmeHttp01, star))
+
+    test.case("and both answer a plain name")
+    test.assert(acmechal.kind_can_answer(AcmeHttp01, plain))
+    test.assert(acmechal.kind_can_answer(AcmeDns01, plain))
+
+@test
+fn test_a_wildcard_and_its_base_name_share_one_txt_record_name() [io]
+    // So an order for both needs TWO values at ONE name, and a provider
+    // API call that REPLACED the record set invalidates the first
+    // challenge when it publishes the second.
+    let star = acmemsg.dns_identifier("*.example.com")
+    let plain = acmemsg.dns_identifier("example.com")
+
+    test.case("they share a record name")
+    test.assert(acmechal.dns01_records_share_a_name(star, plain))
+
+    test.case("and the name is the base name's")
+    match acmechal.dns01_record_name("*.example.com")
+        Ok(n)  => test.assert_eq(n, "_acme-challenge.example.com")
+        Err(_) => test.fail("a wildcard has a record name")
+
+    test.case("an order for both lists that name once")
+    match acmechal.dns01_names_for([star, plain])
+        Ok(names) => test.assert_eq(list.len(names), 1)
+        Err(_)    => test.fail("two identifiers, one record name")
+
+@test
+fn test_a_token_is_checked_before_it_becomes_a_path() [io]
+    // The token comes from the server and goes into
+    // `/.well-known/acme-challenge/<token>`.  One containing `/` or
+    // `..` is a path traversal into the caller's filesystem, written by
+    // a caller that believed a library had checked.
+    test.case("a token with a separator in it is not well formed")
+    test.assert(not acmechal.token_is_wellformed("../../etc/passwd"))
+
+    test.case("and asking for its path is refused rather than answered")
+    match acmechal.http01_path("../../etc/passwd")
+        Ok(_)  => test.fail("that token must never become a path")
+        Err(e) =>
+            match e
+                AcmeChalTokenNotWellformed(_) => test.assert(true)
+                _                             => test.fail("the fault names the character")
+
+    test.case("a token too short to carry the required entropy is refused too")
+    match acmechal.http01_path("abc")
+        Ok(_)  => test.fail("three characters is not 128 bits")
+        Err(e) =>
+            match e
+                AcmeChalTokenTooShort(_, _) => test.assert(true)
+                _                           => test.fail("the fault carries both lengths")
+
+@test
+fn test_the_certificate_request_puts_the_names_in_the_san() [io]
+    // An ACME server does not read the subject.  A client that put the
+    // name there and left the SAN empty gets an order refused with a
+    // message about the CSR not matching, and then looks at the
+    // subject, which is correct.
+    test.case("the subject this package writes is empty, and says so")
+    test.assert(acmecsr.ACME_CSR_SUBJECT_IS_EMPTY)
+
+    test.case("a request for no names at all is refused")
+    match acmecsr.csr_info([], bytes.zeros(64), 100)
+        Ok(_)  => test.fail("a certificate for nothing is not a request")
+        Err(e) =>
+            match e
+                AcmeCsrNoNames => test.assert(true)
+                _              => test.fail("the fault says there were no names")
+
+    test.case("and a wildcard identifier becomes a dNSName with the star in it")
+    let order = AcmeOrder {
+        url: "https://example.com/acme/order/1",
+        status: AcmeOrderReady,
+        expires: "2026-10-01T00:00:00Z",
+        identifiers: [acmemsg.dns_identifier("*.example.com")],
+        authorizations: [],
+        finalize: "https://example.com/acme/order/1/finalize",
+        certificate: "",
+        not_before: "",
+        not_after: "",
+        problem: None }
+    match acmecsr.names_for_order(order)
+        Ok(names) => test.assert_eq(names[0], "*.example.com")
+        Err(_)    => test.fail("a wildcard order has a name")
+
+@test
+fn test_renewal_is_a_fraction_of_the_lifetime() [io]
+    // A ninety-day certificate renewed "thirty days before expiry" and
+    // a six-day certificate renewed the same way are two different
+    // policies, and the second never renews.  Two thirds leaves a third
+    // of the life to keep retrying in.
+    test.case("the published fraction is two thirds")
+    test.assert_eq(acmerenew.ACME_RENEW_AT_NUMERATOR, 2)
+    test.assert_eq(acmerenew.ACME_RENEW_AT_DENOMINATOR, 3)
+
+    let policy = acmerenew.default_policy()
+    let starts = at(2026, 7, 1)
+    let ends = at(2026, 9, 29)
+
+    test.case("a third of the way in is too early")
+    match acmerenew.should_renew(starts, ends, at(2026, 7, 30), policy)
+        Ok(yes) => test.assert(not yes)
+        Err(_)  => test.fail("that is a ninety-day certificate")
+
+    test.case("two thirds of the way in is not")
+    match acmerenew.should_renew(starts, ends, at(2026, 9, 1), policy)
+        Ok(yes) => test.assert(yes)
+        Err(_)  => test.fail("that is a ninety-day certificate")
+
+@test
+fn test_an_expired_certificate_is_the_strongest_yes() [io]
+    // `should_renew` answers true past expiry and `days_left` answers a
+    // negative number rather than zero, because how far past is the
+    // number a caller reports.
+    let policy = acmerenew.default_policy()
+
+    test.case("past expiry still says renew")
+    match acmerenew.should_renew(at(2026, 1, 1), at(2026, 4, 1), at(2026, 9, 12), policy)
+        Ok(yes) => test.assert(yes)
+        Err(_)  => test.fail("an expired certificate is still a certificate")
+
+    test.case("and the days left are negative rather than clamped")
+    test.assert(acmerenew.days_left(at(2026, 4, 1), at(2026, 9, 12)) < 0)
+
+@test
+fn test_an_order_can_arrive_already_satisfied() [io]
+    // A valid authorization is cached by the server for weeks, so a
+    // second order for the same name inside that window arrives `ready`
+    // with nothing to publish.  A client that always expects to solve a
+    // challenge treats the happy path as an anomaly.
+    let order = AcmeOrder {
+        url: "https://example.com/acme/order/2",
+        status: AcmeOrderReady,
+        expires: "2026-10-01T00:00:00Z",
+        identifiers: [acmemsg.dns_identifier("example.com")],
+        authorizations: ["https://example.com/acme/authz/1"],
+        finalize: "https://example.com/acme/order/2/finalize",
+        certificate: "",
+        not_before: "",
+        not_after: "",
+        problem: None }
+
+    test.case("a ready order needs no challenge")
+    test.assert(acmerenew.order_needs_no_challenge(order))
+
+    test.case("and ready is not terminal — finalise still has to happen")
+    test.assert(not acmemsg.is_terminal_order(AcmeOrderReady))
+
+    test.case("valid and invalid both are")
+    test.assert(acmemsg.is_terminal_order(AcmeOrderValid))
+    test.assert(acmemsg.is_terminal_order(AcmeOrderInvalid))
+
+@test
+fn test_the_message_surface_is_complete() [io]
+    // Every remaining `pub fn` of `acmemsg`, named once.
+    let limits = acmemsg.default_limits()
+    let nothing = ""
+
+    test.case("every parser refuses an empty body rather than inventing one")
+    match acmemsg.parse_directory(nothing, limits)
+        Ok(_)  => test.fail("no bytes is no directory")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_account(nothing, "https://example.com/acct/1", limits)
+        Ok(_)  => test.fail("no bytes is no account")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_order(nothing, "https://example.com/order/1", limits)
+        Ok(_)  => test.fail("no bytes is no order")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_authorization(nothing, "https://example.com/authz/1", limits)
+        Ok(_)  => test.fail("no bytes is no authorization")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_challenge(nothing, limits)
+        Ok(_)  => test.fail("no bytes is no challenge")
+        Err(_) => test.assert(true)
+
+    test.case("and every writer answers a payload")
+    match acmemsg.write_new_account(["mailto:ops@example.com"], true, false)
+        Ok(b)  => test.assert(str.len(b) > 0)
+        Err(_) => test.fail("a contact and an agreement are a payload")
+    match acmemsg.write_new_order([acmemsg.dns_identifier("example.com")], "", "")
+        Ok(b)  => test.assert(str.len(b) > 0)
+        Err(_) => test.fail("one identifier is an order")
+    match acmemsg.write_finalize("AAAA")
+        Ok(b)  => test.assert(str.len(b) > 0)
+        Err(_) => test.fail("a request is a finalise payload")
+    match acmemsg.write_revoke("AAAA", 0)
+        Ok(b)  => test.assert(str.len(b) > 0)
+        Err(_) => test.fail("a certificate and a reason are a revocation")
+    test.assert(str.len(acmemsg.write_deactivate()) > 0)
+
+    test.case("the challenge kind table round-trips")
+    test.assert_eq(acmemsg.challenge_kind_name(AcmeHttp01), "http-01")
+    match acmemsg.challenge_kind_of_name("dns-01")
+        AcmeDns01 => test.assert(true)
+        _         => test.fail("dns-01 is DNS-01")
+
+    test.case("the other two terminal predicates and the lookups")
+    test.assert(acmemsg.is_terminal_authz(AcmeAuthzValid))
+    test.assert(not acmemsg.is_terminal_challenge(AcmeChallengePending))
+
+    let authz = AcmeAuthorization {
+        url: "https://example.com/acme/authz/1",
+        identifier: acmemsg.dns_identifier("example.com"),
+        status: AcmeAuthzPending,
+        expires: "2026-10-01T00:00:00Z",
+        wildcard: false,
+        challenges: [] }
+    match acmemsg.challenge_by_kind(authz, AcmeHttp01)
+        Some(_) => test.fail("that authorization has no challenges")
+        None    => test.assert(true)
+
+    let order = AcmeOrder {
+        url: "https://example.com/acme/order/3",
+        status: AcmeOrderPending,
+        expires: "2026-10-01T00:00:00Z",
+        identifiers: [acmemsg.dns_identifier("example.com")],
+        authorizations: ["https://example.com/acme/authz/1"],
+        finalize: "https://example.com/acme/order/3/finalize",
+        certificate: "",
+        not_before: "",
+        not_after: "",
+        problem: None }
+    match acmemsg.identifier_for(order, authz)
+        Some(id) => test.assert_eq(id.value, "example.com")
+        None     => test.fail("the base name matches and the wildcard flags agree")
+
+    test.case("and a problem renders for a person")
+    let p = AcmeProblem {
+        kind: "urn:ietf:params:acme:error:unauthorized",
+        title: "Unauthorized",
+        detail: "Invalid response from http://example.com/.well-known/acme-challenge/x: 404",
+        status: 403,
+        subproblems: [] }
+    test.assert(str.len(acmemsg.problem_text(p)) > 0)
+    test.assert(acmemsg.problem_is_challenge_failure(p))
+
+@test
+fn test_the_jws_and_challenge_surfaces_are_complete() [io]
+    // Every remaining `pub fn` of `acmejws`, `acmechal` and `acmecsr`,
+    // named once.
+    test.case("the signing input and the flattened body")
+    let protected = "{\"alg\":\"ES256\"}"
+    test.assert(str.contains(acmejws.signing_input(protected, "{}"), "."))
+    match acmejws.flattened(protected, "{}", bytes.zeros(64))
+        Ok(b)  => test.assert(str.contains(b, "signature"))
+        Err(_) => test.fail("a 64-byte ES256 signature is the right length")
+
+    test.case("the algorithm allow list")
+    test.assert(acmejws.algorithm_allowed(Es256))
+
+    test.case("a whole signed request, from a signer that refuses")
+    match acmejws.signed_request(refuse_to_sign, Es256, acmejws.nonce("n"),
+                                 "https://example.com/acme/new-order",
+                                 AcmeJwsKid("https://example.com/acme/acct/1"), "{}")
+        Ok(_)  => test.fail("a signer that answers None signs nothing")
+        Err(e) =>
+            match e
+                AcmeJwsSignatureRefused => test.assert(true)
+                _                       => test.fail("the fault says the signer refused")
+
+    test.case("and the canonical JWK comes from the key, not from the caller")
+    match p256.public_key_from_bytes(bytes.to_byte_list(bytes.zeros(32)),
+                                     bytes.to_byte_list(bytes.zeros(32)))
+        Err(_)  => test.assert(true)
+        Ok(key) =>
+            match acmejws.jwk_of_ec(key)
+                Ok(j)  => test.assert(str.starts_with(j, "{\"crv\":\"P-256\""))
+                Err(_) => test.fail("a valid P-256 key has a JWK")
+
+    test.case("the JWK, its thumbprint bytes and the key authorization")
+    match acmejws.thumbprint(a_jwk(), bytes.zeros(32))
+        Ok(t)  => test.assert_eq(bytes.len(t), 32)
+        Err(_) => test.fail("SHA-256 fills a 32-byte buffer")
+    match acmejws.key_authorization("tokenvaluetokenvaluetokenvalue", a_jwk())
+        Ok(k)  => test.assert(str.contains(k, "."))
+        Err(_) => test.fail("a token and a canonical JWK are a key authorization")
+
+    test.case("the HTTP-01 values")
+    test.assert_eq(acmechal.ACME_HTTP01_PORT, 80)
+    test.assert_eq(acmechal.ACME_HTTP01_PREFIX, "/.well-known/acme-challenge/")
+    test.assert_eq(acmechal.ACME_DNS01_LABEL, "_acme-challenge")
+    test.assert_eq(acmechal.http01_content_type(), "application/octet-stream")
+    match acmechal.http01_body("tokenvaluetokenvaluetokenvalue", a_jwk())
+        Ok(b)  => test.assert(not str.ends_with(b, "\n"))
+        Err(_) => test.fail("a well-formed token has a body")
+    match acmechal.http01_url("example.com", "tokenvaluetokenvaluetokenvalue")
+        Ok(u)  => test.assert(str.starts_with(u, "http://"))
+        Err(_) => test.fail("HTTP-01 is fetched over plain HTTP")
+    match acmechal.dns01_record_value("tokenvaluetokenvaluetokenvalue", a_jwk())
+        Ok(v)  => test.assert(str.len(v) > 0)
+        Err(_) => test.fail("a token and a JWK are a record value")
+
+    let authz = AcmeAuthorization {
+        url: "https://example.com/acme/authz/2",
+        identifier: acmemsg.dns_identifier("example.com"),
+        status: AcmeAuthzPending,
+        expires: "2026-10-01T00:00:00Z",
+        wildcard: false,
+        challenges: [] }
+    match acmechal.preferred_challenge(authz, AcmeHttp01)
+        Some(_) => test.fail("that authorization offers nothing")
+        None    => test.assert(true)
+    test.assert(acmechal.dns01_propagation_advice(300) >= 0)
+
+    test.case("the certificate request surface")
+    test.assert(acmecsr.name_is_wellformed("example.com"))
+    test.assert(str.len(acmecsr.scheme_oid_text(AcmeCsrEcdsaP256Sha256)) > 0)
+    test.assert_eq(acmecsr.signature_len_for(AcmeCsrRsaSha256), 0)
+    test.assert_eq(str.len(acmecsr.csr_text(bytes.zeros(0))), 0)
+    match acmecsr.csr(bytes.zeros(8), AcmeCsrEcdsaP256Sha256, bytes.zeros(8))
+        Ok(_)  => test.fail("eight bytes is not an ECDSA signature")
+        Err(_) => test.assert(true)
+    match acmecsr.names_of(bytes.zeros(0))
+        Ok(_)  => test.fail("empty DER carries no names")
+        Err(_) => test.assert(true)
+    match acmecsr.names_match(bytes.zeros(0), [acmemsg.dns_identifier("example.com")])
+        Ok(_)  => test.fail("empty DER has no names to compare")
+        Err(_) => test.assert(true)
+    match acmecsr.first_name_disagreement(bytes.zeros(0), [])
+        Ok(_)  => test.fail("empty DER has no names to compare")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_renewal_surface_is_complete() [io]
+    // Every remaining `pub fn` of `acmerenew`, named once.
+    let policy = acmerenew.with_window_hours(
+        acmerenew.with_least_days_left(acmerenew.default_policy(), 10), 12)
+    test.assert_eq(policy.least_days_left, 10)
+
+    test.case("a fraction outside zero to one is refused")
+    match acmerenew.with_fraction(policy, 5, 3)
+        Ok(_)  => test.fail("five thirds of a lifetime is after it expires")
+        Err(_) => test.assert(true)
+
+    test.case("the window is a range, not an instant")
+    match acmerenew.renewal_window(at(2026, 7, 1), at(2026, 9, 29), policy)
+        Ok(w)  => test.assert(civil.compare_datetime(w.opens, w.closes) < 0)
+        Err(_) => test.fail("a ninety-day lifetime has a window")
+
+    test.case("the lifetime arithmetic")
+    match acmerenew.lifetime_days(at(2026, 7, 1), at(2026, 9, 29))
+        Ok(d)  => test.assert_eq(d, 90)
+        Err(_) => test.fail("that is ninety days")
+    match acmerenew.lifetime_used_percent(at(2026, 7, 1), at(2026, 9, 29), at(2026, 7, 1))
+        Ok(pc) => test.assert_eq(pc, 0)
+        Err(_) => test.fail("nothing is used at the start")
+
+    test.case("the timestamps off the wire")
+    match acmerenew.parse_timestamp("expires", "2026-10-01T00:00:00Z")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("that is RFC 3339")
+
+    let order = AcmeOrder {
+        url: "https://example.com/acme/order/4",
+        status: AcmeOrderPending,
+        expires: "2026-10-01T00:00:00Z",
+        identifiers: [acmemsg.dns_identifier("example.com")],
+        authorizations: [],
+        finalize: "https://example.com/acme/order/4/finalize",
+        certificate: "",
+        not_before: "",
+        not_after: "",
+        problem: None }
+    match acmerenew.order_expires_at(order)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("that order carries an RFC 3339 expiry")
+
+    let authz = AcmeAuthorization {
+        url: "https://example.com/acme/authz/3",
+        identifier: acmemsg.dns_identifier("example.com"),
+        status: AcmeAuthzValid,
+        expires: "2026-10-01T00:00:00Z",
+        wildcard: false,
+        challenges: [] }
+    match acmerenew.authorization_expires_at(authz)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("that authorization carries an RFC 3339 expiry")
+
+    test.case("and the backoff grows without the caller sleeping through it")
+    test.assert(acmerenew.poll_backoff_seconds(4) > acmerenew.poll_backoff_seconds(1))

@@ -1,0 +1,392 @@
+// acmemsg.nv — the objects an ACME server serves, as values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE.  Nothing here
+// reads, writes or waits; a whole issuance conversation is a sequence
+// of JSON documents a test writes out, and the README says what would
+// make it worth a package of its own.
+//
+// EVERY OBJECT HAS A STATUS AND MOST OF THEM ARE NOT TERMINAL.  An
+// order is `pending`, `ready`, `processing`, `valid` or `invalid`; an
+// authorization has six states and a challenge four.  A client that
+// treated anything but `valid` as "not finished yet" polls a `invalid`
+// order until its deadline and then reports a timeout, which is the
+// least useful possible description of a certificate authority having
+// said no.  `is_terminal_order`, `is_terminal_authz` and
+// `is_terminal_challenge` are the three predicates a polling loop needs,
+// and they are public so a caller cannot write the wrong one.
+//
+// THE ERROR DOCUMENT IS THE USEFUL PART OF A FAILURE.  RFC 8555 § 6.7
+// uses RFC 7807 problem documents, and the `type` field is a URN that
+// says what to do: `badNonce` means retry the same request,
+// `rateLimited` means wait and carry the `Retry-After`,
+// `unauthorized` means the challenge did not validate and the `detail`
+// says what the server saw when it looked.  A client that rendered the
+// HTTP status instead reports "403" for all three.
+//
+// AN AUTHORIZATION FOR A WILDCARD CARRIES THE BASE NAME.  The order's
+// identifier is `*.example.com`; the authorization's identifier is
+// `example.com` with `wildcard: true` beside it.  A client that
+// matched authorizations to identifiers by string never finds the one
+// it is looking for.  `AcmeAuthorization.wildcard` is the field that
+// closes it and `identifier_for` is the lookup that uses it.
+
+// The directory: every URL a client needs, fetched once.
+//
+// It is fetched rather than configured because the URLs are the
+// server's to change, and a client with them compiled in breaks on a
+// day nobody chose.
+pub struct AcmeDirectory
+    new_nonce: Str
+    new_account: Str
+    new_order: Str
+    revoke_cert: Str
+    key_change: Str
+    // `meta.termsOfService`, or `""`.  A client that agrees to terms
+    // it did not fetch has agreed to nothing a person read.
+    terms_of_service: Str
+    website: Str
+    caa_identities: [Str]
+    // Whether this server refuses an account without an external
+    // binding — a commercial CA, generally.
+    external_account_required: Bool
+
+// What an account can be.
+pub enum AcmeAccountStatus
+    AcmeAccountValid
+    // The holder deactivated it; it cannot be reactivated.
+    AcmeAccountDeactivated
+    // The server revoked it.
+    AcmeAccountRevoked
+
+// A registered account.
+pub struct AcmeAccount
+    // The account URL, which is the `kid` every later request is signed
+    // with.  It is not in the response body: it is in the `Location`
+    // header of the newAccount reply, which is why `acmeclient` reads
+    // headers and why a client built on a request function that
+    // discards them cannot register at all.
+    url: Str
+    status: AcmeAccountStatus
+    contact: [Str]
+    terms_agreed: Bool
+    orders: Str
+
+// What kind of name an identifier names.
+pub enum AcmeIdentifierKind
+    AcmeDnsIdentifier
+    // RFC 8738's `ip` type.  Named so an order round-trips; the
+    // challenges this package implements do not validate one.
+    AcmeIpIdentifier
+    AcmeUnknownIdentifier(name: Str)
+
+// One name a certificate is being requested for.
+pub struct AcmeIdentifier
+    kind: AcmeIdentifierKind
+    // `example.com`, or `*.example.com` for a wildcard.  The
+    // authorization that answers this one carries the BASE name and a
+    // `wildcard` flag, which is why they cannot be matched by string.
+    value: Str
+
+// Where an order stands.
+pub enum AcmeOrderStatus
+    // Some authorization is not yet valid.
+    AcmeOrderPending
+    // Every authorization is valid; finalise is the next step.
+    AcmeOrderReady
+    // Finalised, and the server is issuing.
+    AcmeOrderProcessing
+    // Issued; `certificate` is the URL to download from.
+    AcmeOrderValid
+    // Terminal.  An authorization failed or the order expired, and the
+    // order cannot be retried — a new one has to be created.
+    AcmeOrderInvalid
+
+// An order for a certificate.
+pub struct AcmeOrder
+    // From the `Location` header of the newOrder reply.
+    url: Str
+    status: AcmeOrderStatus
+    // RFC 3339, as the server wrote it.  Kept as text and parsed by
+    // `acmerenew` on demand, so a timestamp this package cannot parse
+    // does not stop an order being read.
+    expires: Str
+    identifiers: [AcmeIdentifier]
+    authorizations: [Str]
+    finalize: Str
+    // Empty until the status is `valid`.
+    certificate: Str
+    not_before: Str
+    not_after: Str
+    // The problem document when the status is `invalid`.
+    problem: ?AcmeProblem
+
+// Where an authorization stands.
+pub enum AcmeAuthzStatus
+    AcmeAuthzPending
+    AcmeAuthzValid
+    // Terminal: a challenge was attempted and failed.  The order is
+    // invalid too, and a new order is the only way forward.
+    AcmeAuthzInvalid
+    AcmeAuthzDeactivated
+    AcmeAuthzExpired
+    AcmeAuthzRevoked
+
+// One name's authorization, and the ways it may be proved.
+pub struct AcmeAuthorization
+    url: Str
+    // The BASE name, even for a wildcard order: `example.com` for an
+    // order whose identifier was `*.example.com`.
+    identifier: AcmeIdentifier
+    status: AcmeAuthzStatus
+    expires: Str
+    // True when this authorization answers a wildcard identifier.  The
+    // field that makes an order's identifiers findable, and the reason
+    // `identifier_for` exists.
+    wildcard: Bool
+    challenges: [AcmeChallenge]
+
+// A way of proving control of a name.
+pub enum AcmeChallengeKind
+    // A file at a well-known path over plain HTTP on port 80.
+    AcmeHttp01
+    // A TXT record.  The only one that can answer a wildcard.
+    AcmeDns01
+    // RFC 8737, over a TLS handshake with a special certificate.  Named
+    // so a challenge list round-trips; this package does not implement
+    // it, and the README says what it would take.
+    AcmeTlsAlpn01
+    AcmeUnknownChallenge(name: Str)
+
+// Where a challenge stands.
+pub enum AcmeChallengeStatus
+    AcmeChallengePending
+    // The client said go; the server has not answered yet.
+    AcmeChallengeProcessing
+    AcmeChallengeValid
+    // Terminal, and the `error` field is the only thing that says why.
+    AcmeChallengeInvalid
+
+// One challenge.
+pub struct AcmeChallenge
+    url: Str
+    kind: AcmeChallengeKind
+    status: AcmeChallengeStatus
+    // The server's random value.  It is written into a filesystem path
+    // for HTTP-01, so `acmechal.token_is_wellformed` checks it before
+    // anything opens a file.
+    token: Str
+    validated: Str
+    problem: ?AcmeProblem
+
+// RFC 7807's problem document, which is how an ACME server says no.
+pub struct AcmeProblem
+    // The URN — `urn:ietf:params:acme:error:badNonce` and the rest.
+    // This is the field a client branches on; the HTTP status is not.
+    kind: Str
+    title: Str
+    // What the server saw.  For a failed challenge this is the useful
+    // sentence — "Invalid response from http://example.com/... : 404" —
+    // and a client that dropped it leaves an operator with nothing.
+    detail: Str
+    status: Int
+    // One per identifier, for an order that failed on several names at
+    // once.
+    subproblems: [AcmeProblem]
+
+// What a message can be wrong about.
+pub enum AcmeMsgFault
+    // The body was not JSON.
+    AcmeMsgNotJson
+    // A required member was absent, named.
+    AcmeMsgFieldMissing(field: Str)
+    // A member was present with the wrong shape.
+    AcmeMsgFieldWrongKind(field: Str, wanted: Str)
+    // A status string the specification does not define.
+    AcmeMsgUnknownStatus(field: Str, value: Str)
+    // An identifier list with nothing in it, which no order may have.
+    AcmeMsgNoIdentifiers
+    // More of something than the caller's limit allows.
+    AcmeMsgTooMany(what: Str, count: Int, limit: Int)
+
+// The ceilings a parse is held to, so a hostile or broken server
+// cannot make a client allocate without bound.
+pub struct AcmeMsgLimits
+    max_identifiers: Int
+    max_authorizations: Int
+    max_challenges: Int
+    max_subproblems: Int
+    max_body_bytes: Int
+
+// Limits a program ordering its own certificates is comfortable with.
+pub fn default_limits() -> AcmeMsgLimits []
+    todo("acme-nv.acmemsg.default_limits")
+
+// Parse the directory document.
+pub fn parse_directory(body: Str, limits: AcmeMsgLimits) -> Result<AcmeDirectory, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_directory")
+
+// Parse an account object.
+//
+// The URL is not in the body — it is the `Location` header — so it is
+// an argument here rather than something this function could find.
+pub fn parse_account(body: Str, url: Str,
+                     limits: AcmeMsgLimits) -> Result<AcmeAccount, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_account")
+
+// Parse an order object, with the URL the reply's `Location` carried.
+pub fn parse_order(body: Str, url: Str, limits: AcmeMsgLimits) -> Result<AcmeOrder, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_order")
+
+// Parse an authorization object.
+pub fn parse_authorization(body: Str, url: Str,
+                           limits: AcmeMsgLimits) -> Result<AcmeAuthorization, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_authorization")
+
+// Parse a challenge object.
+pub fn parse_challenge(body: Str, limits: AcmeMsgLimits) -> Result<AcmeChallenge, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_challenge")
+
+// Parse a problem document.
+pub fn parse_problem(body: Str, limits: AcmeMsgLimits) -> Result<AcmeProblem, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.parse_problem")
+
+// The newAccount request payload.
+//
+// `terms_agreed` is an argument and has no default, because agreeing
+// to terms on somebody's behalf is not a thing a library does.
+pub fn write_new_account(contact: [Str], terms_agreed: Bool,
+                         only_return_existing: Bool) -> Result<Str, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.write_new_account")
+
+// The newOrder request payload.
+pub fn write_new_order(identifiers: [AcmeIdentifier], not_before: Str,
+                       not_after: Str) -> Result<Str, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.write_new_order")
+
+// The finalise request payload: the certificate request, base64url.
+pub fn write_finalize(csr_base64url: Str) -> Result<Str, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.write_finalize")
+
+// The payload that tells the server a challenge is ready to be checked.
+//
+// It is `{}` — an EMPTY JSON OBJECT — and not an empty payload.  An
+// empty payload is a POST-as-GET, which reads the challenge instead of
+// starting it, so a client that sent the wrong one polls a challenge
+// the server was never asked to check.  `acmejws.post_as_get_payload`
+// is the other one, and the two are separate functions for this
+// reason.
+pub fn write_challenge_ready() -> Str []
+    todo("acme-nv.acmemsg.write_challenge_ready")
+
+// The revokeCert request payload.
+pub fn write_revoke(certificate_der_base64url: Str, reason: Int) -> Result<Str, AcmeMsgFault> []
+    todo("acme-nv.acmemsg.write_revoke")
+
+// The payload that deactivates an account or an authorization.
+pub fn write_deactivate() -> Str []
+    todo("acme-nv.acmemsg.write_deactivate")
+
+// A DNS identifier.
+pub fn dns_identifier(name: Str) -> AcmeIdentifier []
+    todo("acme-nv.acmemsg.dns_identifier")
+
+// Whether an identifier is a wildcard — its value begins `*.`.
+pub fn is_wildcard(id: AcmeIdentifier) -> Bool []
+    todo("acme-nv.acmemsg.is_wildcard")
+
+// The base name of an identifier: `example.com` for `*.example.com`,
+// and itself otherwise.
+//
+// The function that makes an authorization findable, because an
+// authorization for a wildcard carries the base name and a `wildcard`
+// flag rather than the identifier the order asked for.
+pub fn base_name(id: AcmeIdentifier) -> Str []
+    todo("acme-nv.acmemsg.base_name")
+
+// The identifier in an order that this authorization answers.
+//
+// The lookup a client needs and the one it is easy to write wrongly:
+// the match is on the base name AND the wildcard flag, never on the
+// identifier strings.
+pub fn identifier_for(order: AcmeOrder, authz: AcmeAuthorization) -> ?AcmeIdentifier []
+    todo("acme-nv.acmemsg.identifier_for")
+
+// The challenge of a kind in an authorization, or `None`.
+pub fn challenge_by_kind(authz: AcmeAuthorization, kind: AcmeChallengeKind) -> ?AcmeChallenge []
+    todo("acme-nv.acmemsg.challenge_by_kind")
+
+// The challenge kind a wire name denotes.
+pub fn challenge_kind_of_name(name: Str) -> AcmeChallengeKind []
+    todo("acme-nv.acmemsg.challenge_kind_of_name")
+
+// The wire name for a challenge kind.
+pub fn challenge_kind_name(kind: AcmeChallengeKind) -> Str []
+    todo("acme-nv.acmemsg.challenge_kind_name")
+
+// Whether an order will not change again without a new request.
+//
+// True for `valid` and `invalid`.  A polling loop that only stopped on
+// `valid` spins on a refused order until its own deadline and then
+// reports a timeout instead of the reason.
+pub fn is_terminal_order(s: AcmeOrderStatus) -> Bool []
+    todo("acme-nv.acmemsg.is_terminal_order")
+
+// Whether an authorization will not change again.
+pub fn is_terminal_authz(s: AcmeAuthzStatus) -> Bool []
+    todo("acme-nv.acmemsg.is_terminal_authz")
+
+// Whether a challenge will not change again.
+pub fn is_terminal_challenge(s: AcmeChallengeStatus) -> Bool []
+    todo("acme-nv.acmemsg.is_terminal_challenge")
+
+// Whether a problem means "retry this exact request with a new nonce".
+//
+// `urn:ietf:params:acme:error:badNonce`, and it is NOT a failure: RFC
+// 8555 § 6.5 says a client that receives one MUST retry, and a server
+// under load hands them out routinely.  A client that reported it
+// fails intermittently in a way that looks like the network.
+pub fn problem_is_bad_nonce(p: AcmeProblem) -> Bool []
+    todo("acme-nv.acmemsg.problem_is_bad_nonce")
+
+// Whether a problem means "you are asking too often".
+//
+// The `Retry-After` header beside it is the wait, and a client that
+// retried without honouring it makes its own rate limit worse.
+pub fn problem_is_rate_limit(p: AcmeProblem) -> Bool []
+    todo("acme-nv.acmemsg.problem_is_rate_limit")
+
+// Whether a problem means the challenge did not validate.
+//
+// `unauthorized` or `incorrectResponse`, and `detail` is the sentence
+// that says what the server saw when it looked — the one piece of text
+// an operator can act on.
+pub fn problem_is_challenge_failure(p: AcmeProblem) -> Bool []
+    todo("acme-nv.acmemsg.problem_is_challenge_failure")
+
+// The problem URN, or `""` when there is none.
+pub fn problem_kind(p: AcmeProblem) -> Str []
+    todo("acme-nv.acmemsg.problem_kind")
+
+// A one-line rendering of a problem for a person: the detail if there
+// is one, the title if not, and the URN's last segment when there is
+// neither.
+pub fn problem_text(p: AcmeProblem) -> Str []
+    todo("acme-nv.acmemsg.problem_text")
+
+// What went wrong reading a message, in one line.
+//
+// Every variant names the field, because "malformed order" against a
+// real certificate authority is a report nobody can act on.
+//
+// ```novo ignore
+// use acmemsg
+//
+// fn report(e: AcmeMsgFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeMsgFault
+    fn message(self) -> Str
+        todo("acme-nv.acmemsg.AcmeMsgFault.message")

@@ -1,0 +1,178 @@
+// acmechal.nv — the two challenges, as values a caller publishes
+// itself.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THIS PACKAGE DOES NOT SERVE THE CHALLENGE AND DOES NOT UPDATE DNS,
+// and that is the design rather than an omission.  An HTTP-01 challenge
+// is a file at a path, and where that file goes depends on whether the
+// caller runs a web server, a reverse proxy, a static host or nothing
+// at all on port 80.  A DNS-01 challenge is a TXT record, and putting
+// one there is an API call to whichever of forty providers holds the
+// zone.  A library that guessed either would be wrong for most callers
+// and would drag a web server and forty API clients in behind it.
+//
+// So what is here is the four values: a path and a body for HTTP-01, a
+// record name and a record value for DNS-01.  Each is a named function
+// with an assertion behind it, because each of them is a string that
+// fails silently when it is built wrong.
+//
+// THE TOKEN GOES INTO A FILESYSTEM PATH, SO IT IS CHECKED FIRST.  RFC
+// 8555 § 8.3 puts the token in `/.well-known/acme-challenge/<token>`,
+// and the token comes from the server.  A token containing `/` or `..`
+// is a path traversal into the caller's filesystem, written by a
+// caller that believed a library had checked.  `token_is_wellformed`
+// is that check — base64url characters only, no separators, a length
+// bound — and `http01_path` refuses a token that fails it rather than
+// answering a path.  RFC 8555 § 11.3 requires at least 128 bits of
+// entropy in a token; a short one is refused for that reason too.
+//
+// THE HTTP-01 BODY IS THE KEY AUTHORIZATION EXACTLY, WITH NO NEWLINE.
+// A shell redirect adds one and the server compares the bytes.  RFC
+// 8555 § 8.3 does say a server SHOULD ignore trailing whitespace, and
+// SHOULD is why this is still the commonest way an HTTP-01 challenge
+// fails against a server that does not.
+//
+// A WILDCARD'S TXT RECORD IS AT THE BASE NAME.  The record for
+// `*.example.com` is `_acme-challenge.example.com` — the same record
+// name as for `example.com` itself, not `_acme-challenge.*.example.com`
+// and not `_acme-challenge.wildcard.example.com`.  So an order for both
+// `example.com` and `*.example.com` needs TWO TXT records at ONE name,
+// and a provider API call that replaced the record rather than adding
+// to it invalidates the first challenge when it publishes the second.
+// `dns01_record_name` answers the same name for both and
+// `dns01_records_share_a_name` is the predicate that says so out loud.
+
+// The prefix every DNS-01 record name carries.
+pub const ACME_DNS01_LABEL = "_acme-challenge"
+
+// The directory an HTTP-01 challenge is served from.
+pub const ACME_HTTP01_PREFIX = "/.well-known/acme-challenge/"
+
+// The port an HTTP-01 challenge is fetched on, which is not negotiable.
+//
+// 80, over plain HTTP.  A server that only listens on 443 cannot answer
+// an HTTP-01 challenge at all, and that is the single commonest reason
+// to reach for DNS-01 instead.
+pub const ACME_HTTP01_PORT = 80
+
+// What can go wrong preparing a challenge.
+pub enum AcmeChalFault
+    // A token with a character outside base64url's alphabet, naming the
+    // offending position.  It is refused before anything opens a file,
+    // because the token goes into a path.
+    AcmeChalTokenNotWellformed(at: Int)
+    // A token shorter than RFC 8555 § 11.3's entropy floor.
+    AcmeChalTokenTooShort(length: Int, least: Int)
+    // A challenge of a kind this package does not prepare.
+    AcmeChalKindUnsupported(kind: AcmeChallengeKind)
+    // The key authorization could not be built.
+    AcmeChalKeyAuthorizationRefused(detail: Str)
+    // A name that is not a DNS name.
+    AcmeChalNotADnsName(value: Str)
+
+// Whether a token is safe to put in a path and long enough to be a
+// token.
+//
+// base64url characters only — no `/`, no `.`, no `%` — and at least
+// the entropy floor's worth of them.
+pub fn token_is_wellformed(token: Str) -> Bool []
+    todo("acme-nv.acmechal.token_is_wellformed")
+
+// The path an HTTP-01 challenge is served at.
+//
+// Refuses a token that fails `token_is_wellformed` rather than
+// answering a path, because the alternative is a caller writing a file
+// wherever a certificate authority's token told it to.
+pub fn http01_path(token: Str) -> Result<Str, AcmeChalFault> []
+    todo("acme-nv.acmechal.http01_path")
+
+// The exact bytes an HTTP-01 challenge file contains: the key
+// authorization, with no trailing newline.
+pub fn http01_body(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFault> []
+    todo("acme-nv.acmechal.http01_body")
+
+// The full URL the server will fetch, for a caller that wants to check
+// its own setup before telling the server to look.
+//
+// Plain HTTP on port 80, and the specification allows the server to
+// follow a redirect to HTTPS — which is how a site that redirects
+// everything still passes.
+pub fn http01_url(domain: Str, token: Str) -> Result<Str, AcmeChalFault> []
+    todo("acme-nv.acmechal.http01_url")
+
+// The `Content-Type` an HTTP-01 response should carry, which is
+// `application/octet-stream` — or nothing at all.
+//
+// Named because the wrong answer people reach for is `text/html`: a web server
+// configured to serve a friendly 404 page returns 200 with HTML, and
+// the challenge fails with a message about the response not matching
+// rather than about the file being absent.
+pub fn http01_content_type() -> Str []
+    todo("acme-nv.acmechal.http01_content_type")
+
+// The TXT record name for a domain: `_acme-challenge.<base name>`.
+//
+// The SAME name for `example.com` and for `*.example.com`, which is
+// why an order for both needs two records at one name.
+pub fn dns01_record_name(domain: Str) -> Result<Str, AcmeChalFault> []
+    todo("acme-nv.acmechal.dns01_record_name")
+
+// The TXT record's value: base64url of the SHA-256 of the key
+// authorization.
+//
+// The digest and not the key authorization itself, because a TXT
+// string is limited to 255 characters and a key authorization is
+// longer than that.
+pub fn dns01_record_value(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFault> []
+    todo("acme-nv.acmechal.dns01_record_value")
+
+// Whether two identifiers need their TXT records at the same name.
+//
+// True for `example.com` and `*.example.com`, which is the case a
+// provider API call that REPLACES a record set gets wrong: publishing
+// the second challenge's value removes the first's, and the first
+// challenge then fails.  Both values have to be present at once.
+pub fn dns01_records_share_a_name(a: AcmeIdentifier, b: AcmeIdentifier) -> Bool []
+    todo("acme-nv.acmechal.dns01_records_share_a_name")
+
+// Every distinct TXT record name an order needs, deduplicated.
+pub fn dns01_names_for(identifiers: [AcmeIdentifier]) -> Result<[Str], AcmeChalFault> []
+    todo("acme-nv.acmechal.dns01_names_for")
+
+// Whether a challenge kind can answer this identifier.
+//
+// A wildcard can be answered ONLY by DNS-01.  A client that offered
+// HTTP-01 for one has told the server to fetch a file from a host that
+// the wildcard does not name.
+pub fn kind_can_answer(kind: AcmeChallengeKind, id: AcmeIdentifier) -> Bool []
+    todo("acme-nv.acmechal.kind_can_answer")
+
+// The challenge in an authorization this package can actually prepare,
+// preferring the kind the caller named.
+pub fn preferred_challenge(authz: AcmeAuthorization, prefer: AcmeChallengeKind) -> ?AcmeChallenge []
+    todo("acme-nv.acmechal.preferred_challenge")
+
+// How long a caller should wait for a DNS change to be visible before
+// telling the server to look, in seconds.
+//
+// A recommendation rather than a sleep: this module performs nothing.
+// It is the zone's negative-caching TTL that decides, and a client that
+// told the server to check immediately after publishing gets a
+// resolver's cached NXDOMAIN and a failed challenge it then cannot
+// retry on the same order.
+pub fn dns01_propagation_advice(negative_ttl_seconds: Int) -> Int []
+    todo("acme-nv.acmechal.dns01_propagation_advice")
+
+// What went wrong preparing a challenge, in one line.
+//
+// ```novo ignore
+// use acmechal
+//
+// fn report(e: AcmeChalFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeChalFault
+    fn message(self) -> Str
+        todo("acme-nv.acmechal.AcmeChalFault.message")

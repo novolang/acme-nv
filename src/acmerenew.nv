@@ -1,0 +1,186 @@
+// acmerenew.nv — when to renew, which is a fraction of a lifetime and
+// not a number of days.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`, and "now" is an argument.
+//
+// RENEW AT A FRACTION OF THE LIFETIME, NOT AT A FIXED OFFSET FROM
+// EXPIRY.  A ninety-day certificate renewed "thirty days before expiry"
+// and a six-day certificate renewed the same way are two very different
+// policies, and the second one never renews at all.  Two thirds of the
+// lifetime is the figure Let's Encrypt publishes, and what it buys is
+// the remaining third: a renewal that fails has a third of the
+// certificate's life left to keep retrying in, which is long enough for
+// a person to be told and to fix something.
+//
+// A FLEET THAT RENEWS AT ONE INSTANT RENEWS TOGETHER.  Every machine
+// installed on the same afternoon has the same `notAfter`, so a policy
+// computed from `notAfter` alone puts every renewal in the same hour —
+// against a rate-limited API, from a network that may be having the
+// problem that caused the renewal to matter.  `renewal_window` answers
+// a RANGE rather than an instant, and the caller spreads its own
+// attempts across it with whatever source of variation it has.  This
+// module has no randomness, because a `core`-shaped module cannot have
+// any and because reproducible renewal planning is worth more than a
+// jitter this package chose.
+//
+// AND A CERTIFICATE THAT IS ALREADY EXPIRED IS NOT A REASON TO STOP.
+// `should_renew` answers true for an expired certificate, and
+// `days_left` answers a negative number rather than zero, because the
+// information a caller needs at that point is how far past it is.
+//
+// THE TIMESTAMPS COME OFF THE WIRE AS TEXT AND ARE PARSED HERE.  An
+// order and an authorization carry RFC 3339 strings; `acmemsg` keeps
+// them as text so that a timestamp this package cannot parse does not
+// stop an order being read, and this module is where they become
+// dates.  calendar-nv's `parse_rfc3339` does the work.
+
+// The fraction of a lifetime after which renewal should begin, as a
+// numerator and a denominator.
+//
+// Two thirds.  Integers rather than a float so the arithmetic is exact
+// and the same on every machine.
+pub const ACME_RENEW_AT_NUMERATOR = 2
+
+// The denominator of the renewal fraction.
+pub const ACME_RENEW_AT_DENOMINATOR = 3
+
+// A renewal policy.
+pub struct AcmeRenewalPolicy
+    // The fraction of the lifetime after which to renew.
+    at_numerator: Int
+    at_denominator: Int
+    // A floor, for a certificate whose lifetime is long enough that the
+    // fraction would leave months: renew no later than this many days
+    // before expiry whatever the fraction says.
+    least_days_left: Int
+    // The width of the window renewal attempts are spread across, in
+    // hours.  The caller does the spreading; this module only says how
+    // wide the window is.
+    window_hours: Int
+
+// When a certificate should be renewed: a range, not an instant.
+pub struct AcmeRenewalWindow
+    // The earliest sensible moment.
+    opens: CivilDateTime
+    // The latest, after which the certificate is close enough to expiry
+    // that a failure has no room left.
+    closes: CivilDateTime
+
+// What can go wrong planning a renewal.
+pub enum AcmeRenewFault
+    // A timestamp that is not RFC 3339, with the text so a report can
+    // quote it.
+    AcmeRenewBadTimestamp(field: Str, value: Str)
+    // `notAfter` before `notBefore`.
+    AcmeRenewInvertedLifetime
+    // A policy whose fraction is not between zero and one.
+    AcmeRenewBadFraction(numerator: Int, denominator: Int)
+    // calendar-nv refused the arithmetic — a date outside its range.
+    AcmeRenewDateOutOfRange
+
+// The published policy: two thirds of the lifetime, a floor of seven
+// days, spread over a twenty-four hour window.
+pub fn default_policy() -> AcmeRenewalPolicy []
+    todo("acme-nv.acmerenew.default_policy")
+
+// A policy with a different fraction.
+pub fn with_fraction(p: AcmeRenewalPolicy, numerator: Int,
+                     denominator: Int) -> Result<AcmeRenewalPolicy, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.with_fraction")
+
+// A policy with a different floor.
+pub fn with_least_days_left(p: AcmeRenewalPolicy, days: Int) -> AcmeRenewalPolicy []
+    todo("acme-nv.acmerenew.with_least_days_left")
+
+// A policy with a different spreading window.
+pub fn with_window_hours(p: AcmeRenewalPolicy, hours: Int) -> AcmeRenewalPolicy []
+    todo("acme-nv.acmerenew.with_window_hours")
+
+// The window a certificate with this lifetime should be renewed in.
+pub fn renewal_window(not_before: CivilDateTime, not_after: CivilDateTime,
+                      p: AcmeRenewalPolicy) -> Result<AcmeRenewalWindow, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.renewal_window")
+
+// Whether it is time.
+//
+// True for an already-expired certificate too: the question a caller
+// asks is whether to act, and a certificate that expired yesterday is
+// the strongest possible yes.
+pub fn should_renew(not_before: CivilDateTime, not_after: CivilDateTime, now: CivilDateTime,
+                    p: AcmeRenewalPolicy) -> Result<Bool, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.should_renew")
+
+// Days until expiry — NEGATIVE when it has already passed, rather than
+// clamped at zero, because how far past is the number a caller reports.
+pub fn days_left(not_after: CivilDateTime, now: CivilDateTime) -> Int []
+    todo("acme-nv.acmerenew.days_left")
+
+// How long the certificate is good for altogether, in days.
+pub fn lifetime_days(not_before: CivilDateTime,
+                     not_after: CivilDateTime) -> Result<Int, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.lifetime_days")
+
+// How far into the lifetime `now` is, as a percentage.
+//
+// The number a dashboard shows, and the one that makes a fleet's
+// renewal spread visible: a hundred machines all at 71% is the
+// thundering herd this module exists to avoid.
+pub fn lifetime_used_percent(not_before: CivilDateTime, not_after: CivilDateTime,
+                             now: CivilDateTime) -> Result<Int, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.lifetime_used_percent")
+
+// Read an RFC 3339 timestamp off an ACME object.
+//
+// The field name is an argument so the fault can say which field was
+// wrong, which is the difference between a report an operator can act
+// on and "bad date".
+pub fn parse_timestamp(field: Str, value: Str) -> Result<CivilDateTime, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.parse_timestamp")
+
+// When an order stops being usable, off its `expires` field.
+//
+// An order expires whether or not its certificate has been downloaded,
+// and a client that kept a `pending` order across a restart has to know
+// that the one it saved may be gone.
+pub fn order_expires_at(order: AcmeOrder) -> Result<CivilDateTime, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.order_expires_at")
+
+// When an authorization stops being usable.
+//
+// Valid authorizations are CACHED BY THE SERVER and outlive the order
+// they were created for — thirty days, for Let's Encrypt.  A second
+// order for the same name inside that window arrives `ready` with no
+// challenge at all, which is a case a client that always expects to
+// solve a challenge treats as an error.
+pub fn authorization_expires_at(authz: AcmeAuthorization) -> Result<CivilDateTime, AcmeRenewFault> []
+    todo("acme-nv.acmerenew.authorization_expires_at")
+
+// Whether an order arrived already satisfied by cached authorizations.
+//
+// True for an order whose status is `ready` on creation.  The
+// happy path a client must not treat as an anomaly: nothing has to be
+// published, and the next step is finalise.
+pub fn order_needs_no_challenge(order: AcmeOrder) -> Bool []
+    todo("acme-nv.acmerenew.order_needs_no_challenge")
+
+// How long to wait before polling again, in seconds, given how many
+// attempts have already been made.
+//
+// Exponential with a ceiling, as an arithmetic function of the attempt
+// count — so a test asserts the schedule without sleeping through it,
+// and the caller owns the sleep.
+pub fn poll_backoff_seconds(attempt: Int) -> Int []
+    todo("acme-nv.acmerenew.poll_backoff_seconds")
+
+// What went wrong planning a renewal, in one line.
+//
+// ```novo ignore
+// use acmerenew
+//
+// fn report(e: AcmeRenewFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeRenewFault
+    fn message(self) -> Str
+        todo("acme-nv.acmerenew.AcmeRenewFault.message")

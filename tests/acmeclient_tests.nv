@@ -1,0 +1,129 @@
+// acmeclient_tests.nv — the one module in this package that performs
+// anything.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: acme-nv.acmeclient.<fn>`
+// before a socket is opened.
+//
+// THE DIRECTORY URL THESE TESTS USE IS THE STAGING ONE, and that is the
+// habit the package wants a reader to pick up: every rate limit a
+// first-time user meets is one they would not have met against staging.
+
+use std.test
+use std.bytes
+use std.list
+use acmemsg
+use acmejws
+use acmeclient
+
+fn refuse_to_sign(input: Bytes) -> ?Bytes
+    None
+
+@test
+fn test_the_staging_directory_is_named_beside_the_production_one() [io]
+    // Named together on purpose: a first-time user who reaches for the
+    // production URL burns a weekly rate limit learning what this
+    // library does.
+    test.case("both are URLs")
+    test.assert(str.starts_with(acmeclient.letsencrypt_directory_url(), "https://"))
+    test.assert(str.starts_with(acmeclient.letsencrypt_staging_directory_url(), "https://"))
+
+    test.case("and they are not the same one")
+    test.assert(acmeclient.letsencrypt_directory_url() != acmeclient.letsencrypt_staging_directory_url())
+
+@test
+fn test_there_is_no_get_on_this_page() [io, net, time, async]
+    // RFC 8555 § 6.3 replaced GET with POST-as-GET: a signed POST with
+    // an empty payload.  A client that sent a GET to an order URL gets
+    // 405 from every production server, and the failure names the
+    // method rather than the design mistake.  So the read is
+    // `post_as_get` and there is no `get` at all.
+    let s = acmeclient.signer(Es256, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"A\",\"y\":\"B\"}",
+                              refuse_to_sign)
+    match acmeclient.session(acmeclient.letsencrypt_staging_directory_url(), s)
+        Err(_)   => test.assert(true)
+        Ok(sess) =>
+            test.case("a read is a signed POST with nothing in it")
+            match acmeclient.post_as_get(sess, acmejws.nonce("n"), "https://example.com/acme/order/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+@test
+fn test_the_client_surface_is_complete() [io, net, time, async]
+    // Every `pub fn` of `acmeclient`, named once.  The session is never
+    // built — the first `todo()` ends the test — but the calls are
+    // type-checked, which is what an interface release is for.
+    let signer = acmeclient.signer(Es256, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"A\",\"y\":\"B\"}",
+                                   refuse_to_sign)
+    match acmeclient.session(acmeclient.letsencrypt_staging_directory_url(), signer)
+        Err(_) => test.assert(true)
+        Ok(s0) =>
+            let s = acmeclient.with_user_agent(acmeclient.with_timeout(s0, 30000), "acme-nv/0.0.1")
+            let n = acmejws.nonce("n")
+
+            test.case("a fresh nonce, and the two request shapes")
+            match acmeclient.fresh_nonce(s)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.post(s, n, "https://example.com/acme/new-order",
+                                  AcmeJwsKid("https://example.com/acme/acct/1"), "{}")
+                Ok(x)  =>
+                    test.assert(not acmeclient.is_problem(x))
+                    match acmeclient.problem_of(x)
+                        Ok(_)  => test.assert(true)
+                        Err(_) => test.assert(true)
+                    test.assert_eq(list.len(acmeclient.alternate_chains(x)), 0)
+                Err(_) => test.assert(true)
+
+            test.case("the account calls")
+            match acmeclient.new_account(s, n, ["mailto:ops@example.com"], true)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.find_account(s, n)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the order calls")
+            match acmeclient.new_order(s, n, [acmemsg.dns_identifier("example.com")])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.authorization(s, n, "https://example.com/acme/authz/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.challenge_ready(s, n, "https://example.com/acme/chall/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the three polls, each one request and no loop")
+            match acmeclient.poll_challenge(s, n, "https://example.com/acme/chall/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.poll_authorization(s, n, "https://example.com/acme/authz/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.poll_order(s, n, "https://example.com/acme/order/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("finalise, download, revoke and deactivate")
+            match acmeclient.finalize(s, n, "https://example.com/acme/order/1/finalize", bytes.zeros(8))
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.download_certificate(s, n, "https://example.com/acme/cert/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.revoke(s, n, bytes.zeros(8), 0)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match acmeclient.deactivate_authorization(s, n, "https://example.com/acme/authz/1")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+@test
+fn test_the_clock_read_is_one_function() [io, time]
+    // The `[time]` in every client row above is std.http's request
+    // deadline; this is the one clock read the package makes for its
+    // own sake, and `acmerenew` takes what it answers.
+    test.case("it answers a civil date and time")
+    let now = acmeclient.now_civil()
+    test.assert(now.date.year > 2000)

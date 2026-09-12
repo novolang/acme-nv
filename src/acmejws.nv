@@ -1,0 +1,213 @@
+// acmejws.nv — the request signature, and the value that makes a
+// replayed request impossible to write.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// A NONCE IS CONSUMED BY ONE REQUEST AND REPLACED BY ITS REPLY, AND
+// `AcmeNonce` IS A VALUE SO THAT RULE IS THE TYPE.  Every ACME POST
+// carries a server-issued nonce in its protected header; the server
+// checks it, discards it, and returns a fresh one in the reply's
+// `Replay-Nonce` header.  A client that kept one in a mutable field and
+// used it twice gets `badNonce` on the second request — routinely, and
+// only under load, which is the worst way for a bug to present.  Here
+// `protected_header` TAKES a nonce by value and `acmeclient`'s exchange
+// answers the next one, so a caller that wanted to send two requests
+// with one nonce has to write code that visibly reuses a value.
+//
+// AND `badNonce` IS A RETRY, NOT A FAILURE.  RFC 8555 § 6.5: a client
+// that receives one MUST retry the same request with the new nonce
+// from that very reply.  `acmemsg.problem_is_bad_nonce` is the
+// predicate and `acmeclient.post` does the retry; the rule is written
+// here because this is the module the nonce belongs to.
+//
+// THE KEY IS IDENTIFIED TWO DIFFERENT WAYS AND NEVER BOTH.  RFC 8555
+// § 6.2: newAccount and a revocation signed by the certificate key
+// carry the full public key as `jwk`; EVERY OTHER REQUEST carries the
+// account URL as `kid`.  A protected header with both is refused, and
+// one with `jwk` where `kid` was expected is refused too — so
+// `AcmeJwsKeyId` has exactly two cases and no way to express both at
+// once.
+//
+// THE THUMBPRINT IS A DIGEST OF A CANONICAL STRING, AND THE
+// CANONICALISATION IS THE WHOLE OF IT.  RFC 7638: the JSON object
+// contains ONLY the members required for the key type, with the member
+// names in lexicographic order, with no whitespace and no line breaks.
+// For a P-256 key that is exactly `{"crv":"P-256","kty":"EC","x":"…","y":"…"}`.
+// An extra member, a different order, or one space produces a
+// different thumbprint, which produces a different key authorization,
+// which makes every challenge fail with a message about the response
+// not matching — and nothing anywhere says the JSON was the problem.
+//
+// THE PAYLOAD OF A READ IS THE EMPTY STRING AND NOT `{}`.  RFC 8555
+// § 6.3 replaced GET with POST-as-GET: a signed POST whose payload is
+// zero bytes.  `{}` is a different request — for a challenge it means
+// "begin validating" — so the two have separate named functions here
+// and in `acmemsg`, and neither has a default.
+
+// A server-issued nonce, good for exactly one request.
+//
+// A value rather than a string so that the single-use rule is visible
+// in the types: `protected_header` takes one and an exchange answers
+// the next.
+pub struct AcmeNonce
+    value: Str
+
+// How a request names the key that signed it.
+//
+// Two cases and no third, because RFC 8555 § 6.2 allows exactly one of
+// them per request and a header carrying both is refused.
+pub enum AcmeJwsKeyId
+    // The full public key, for newAccount and for a revocation signed
+    // with the certificate's own key.  The JSON is RFC 7638 canonical
+    // form — `jwk_of_ec` produces it.
+    AcmeJwsJwk(jwk_json: Str)
+    // The account URL, for every other request.
+    AcmeJwsKid(url: Str)
+
+// What can go wrong building a signed request.
+pub enum AcmeJwsFault
+    // A protected header for a request that needs `kid` was given a
+    // `jwk`, or the reverse.  It carries both so the message can say
+    // which request wanted which.
+    AcmeJwsWrongKeyId(request: Str, wanted: Str)
+    // The signing function refused.
+    AcmeJwsSignatureRefused
+    // A signature of the wrong length for the algorithm — Es256's is
+    // exactly 64 bytes, the fixed-width `r || s`, and NOT the DER
+    // SEQUENCE a certificate carries.
+    AcmeJwsSignatureWrongLength(got: Int, want: Int)
+    // An algorithm ACME does not allow — a symmetric one, whose holder
+    // could forge as well as verify.  Refused here rather than by the
+    // server.
+    AcmeJwsAlgorithmNotAllowed(name: Str)
+    // A JWK that is not in RFC 7638 canonical form, so its thumbprint
+    // would be wrong.
+    AcmeJwsJwkNotCanonical(detail: Str)
+    // A key this package cannot describe as a JWK.
+    AcmeJwsUnsupportedKey
+
+// A nonce from a `Replay-Nonce` header.
+pub fn nonce(value: Str) -> AcmeNonce []
+    todo("acme-nv.acmejws.nonce")
+
+// The nonce's text, for a caller that has to log it.
+pub fn nonce_value(n: AcmeNonce) -> Str []
+    todo("acme-nv.acmejws.nonce_value")
+
+// The protected header, as canonical JSON.
+//
+// It carries four members and no more: `alg`, `nonce`, `url`, and
+// exactly one of `kid` or `jwk`.  The `url` is the full request URL and
+// it is signed — which is what stops a signed request being replayed
+// against a different endpoint on the same server.
+pub fn protected_header(alg: JwtAlg, n: AcmeNonce, url: Str,
+                        key: AcmeJwsKeyId) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.protected_header")
+
+// The bytes a JWS signature is taken over:
+// `base64url(protected) || "." || base64url(payload)`.
+//
+// A separate function because the signing itself is the caller's — see
+// `signed_request` and the README's "What is missing" section.
+pub fn signing_input(protected_json: Str, payload_json: Str) -> Str []
+    todo("acme-nv.acmejws.signing_input")
+
+// The flattened JSON serialisation an ACME request body is:
+// `{"protected":"…","payload":"…","signature":"…"}`.
+//
+// Flattened, not compact.  A JWT's compact form — three segments joined
+// by dots — is what jwt-nv produces and is not what an ACME server
+// accepts, which is why this package builds the body rather than
+// calling `jwttoken.encode`.
+pub fn flattened(protected_json: Str, payload_json: Str,
+                 signature: Bytes) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.flattened")
+
+// One signed request body, from a signing function the caller supplies.
+//
+// The signer is an argument because there is no ECDSA signer on this
+// grid: p256-nv carries ECDH alone and jwt-nv publishes no raw signer
+// over arbitrary bytes.  The README names both rows.  It is a named
+// function rather than a lambda so the shape survives a device build.
+//
+// The signature it must answer is the FIXED-WIDTH `r || s` — 64 bytes
+// for Es256 — and not the DER SEQUENCE a certificate carries.  A signer
+// that answered DER produces a body every ACME server refuses with a
+// message about the signature being invalid, and asn1-nv's
+// `ecdsa_signature_rs` is the conversion.
+pub fn signed_request(sign: fn(Bytes) -> ?Bytes, alg: JwtAlg, n: AcmeNonce, url: Str,
+                      key: AcmeJwsKeyId, payload_json: Str) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.signed_request")
+
+// Whether an algorithm may sign an ACME request.
+//
+// Es256 and Rs256 may — jwt-nv names exactly three algorithms and the
+// third, Hs256, is symmetric: a shared secret whose holder can also
+// sign, which is not a thing an account key may be.  So this is a
+// refusal of Hs256 and of anything a later jwt-nv adds without ACME
+// allowing it, made here rather than left to the server.
+pub fn algorithm_allowed(alg: JwtAlg) -> Bool []
+    todo("acme-nv.acmejws.algorithm_allowed")
+
+// The JWK for a P-256 public key, in RFC 7638 canonical form.
+//
+// Canonical means: those four members, in that order, with no
+// whitespace.  It is the same string the thumbprint is taken over, so
+// there is one spelling of a key in this package and no way for the
+// header's copy and the thumbprint's copy to differ.
+pub fn jwk_of_ec(public: PublicKey) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.jwk_of_ec")
+
+// RFC 7638's thumbprint: SHA-256 over the canonical JWK.
+pub fn thumbprint(jwk_json: Str, out: Bytes) -> Result<Bytes, AcmeJwsFault> []
+    todo("acme-nv.acmejws.thumbprint")
+
+// The thumbprint as base64url without padding, which is the form a key
+// authorization carries.
+pub fn thumbprint_text(jwk_json: Str) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.thumbprint_text")
+
+// The key authorization: `token || "." || base64url(thumbprint)`.
+//
+// The string the server expects to find — verbatim, with no trailing
+// newline — when it fetches an HTTP-01 challenge, and the string whose
+// digest a DNS-01 record carries.  It is here rather than in `acmechal`
+// because it is a property of the KEY, and the two challenges are two
+// ways of publishing it.
+pub fn key_authorization(token: Str, jwk_json: Str) -> Result<Str, AcmeJwsFault> []
+    todo("acme-nv.acmejws.key_authorization")
+
+// The payload of a POST-as-GET: the empty string.
+//
+// Zero bytes, which is not `{}`.  RFC 8555 § 6.3 made every read a
+// signed POST with an empty payload, and `{}` is a different request —
+// on a challenge URL it starts validation.  `acmemsg.write_challenge_ready`
+// is that other one.
+pub fn post_as_get_payload() -> Str []
+    todo("acme-nv.acmejws.post_as_get_payload")
+
+// base64url without padding, which is every encoded field in a JWS.
+//
+// Without padding: RFC 7515 § 2 strips the `=`, and a client that sent
+// standard base64 has its signature refused with a message that says
+// nothing about the encoding.
+pub fn base64url(data: Bytes) -> Str []
+    todo("acme-nv.acmejws.base64url")
+
+// The inverse, for reading a downloaded certificate or a nonce a
+// server encoded.
+pub fn base64url_decode(text: Str) -> Result<Bytes, AcmeJwsFault> []
+    todo("acme-nv.acmejws.base64url_decode")
+
+// What went wrong signing a request, in one line.
+//
+// ```novo ignore
+// use acmejws
+//
+// fn report(e: AcmeJwsFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeJwsFault
+    fn message(self) -> Str
+        todo("acme-nv.acmejws.AcmeJwsFault.message")

@@ -1,0 +1,156 @@
+// acmecsr.nv — the certificate request, and the field nobody reads.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THE SUBJECT IS IGNORED AND THE SAN EXTENSION IS THE REQUEST.  A
+// PKCS#10 certification request has a `subject` Name, and every
+// tutorial fills in a common name there.  An ACME server does not read
+// it: RFC 8555 § 7.4 says the names requested are the ones in the
+// subjectAltName extension, and the CA Browser Forum has required the
+// SAN since 2017.  A client that put the name in the subject and left
+// the SAN empty gets an order refused with a message about the CSR not
+// matching, and then looks at the subject, which is correct.
+// `csr_info` takes the names and writes the SAN; there is no subject
+// parameter at all, and `ACME_CSR_SUBJECT_IS_EMPTY` says why in a
+// place a reader will meet it.
+//
+// THE SAN LIST MUST MATCH THE ORDER'S IDENTIFIERS EXACTLY.  Not a
+// superset and not a subset: a name in the CSR that the order does not
+// carry is refused, and a name in the order that the CSR omits is
+// refused too.  The order they appear in does not matter, which is the
+// only leniency there is.  `names_match` is that comparison and it is
+// public so a caller can run it BEFORE finalising — because a
+// mismatched finalise makes the whole order invalid, and an order
+// cannot be retried.
+//
+// THE SIGNATURE IS THE CALLER'S.  A certification request is signed by
+// the key it requests a certificate for, and there is no ECDSA signer
+// on this grid — see the README.  So `csr_info` answers the exact bytes
+// to sign and `csr` puts a signature back around them, which is also
+// the shape a caller with a key in a secure element needs.
+//
+// AND THE SIGNATURE HERE IS DER, WHICH IS THE OPPOSITE OF THE JWS.
+// A CSR's ECDSA signature is the DER `SEQUENCE { r INTEGER, s INTEGER }`;
+// an ACME request's JWS signature is the fixed-width `r || s`.  Same
+// key, same algorithm, two encodings, in the same issuance flow.
+// asn1-nv's `ecdsa_signature_der` and `ecdsa_signature_rs` convert
+// between them, and a client that used one form for both has one of
+// the two refused with a message about an invalid signature.
+
+// A PKCS#10 subject this package writes: the empty Name.
+//
+// A constant rather than a comment, because the empty subject is the
+// thing a reader will be surprised by and this is where they will look.
+pub const ACME_CSR_SUBJECT_IS_EMPTY = true
+
+// What can go wrong building a certificate request.
+pub enum AcmeCsrFault
+    // No names at all; a certificate request for nothing.
+    AcmeCsrNoNames
+    // A name that is not a DNS name — an empty label, a trailing dot
+    // where the SAN form does not take one.
+    AcmeCsrNotADnsName(value: Str)
+    // More names than the caller's limit allows.
+    AcmeCsrTooManyNames(count: Int, limit: Int)
+    // The public key could not be written as a SubjectPublicKeyInfo.
+    AcmeCsrBadPublicKey
+    // A signature of the wrong length or encoding for the algorithm.
+    AcmeCsrBadSignature(detail: Str)
+    // asn1-nv refused to encode or decode, at an offset.
+    AcmeCsrMalformed(offset: Int)
+    // The CSR's names and the order's identifiers do not agree, naming
+    // the first name that is in one and not the other.
+    AcmeCsrNamesDisagree(name: Str, in_order: Bool)
+
+// How a certification request is signed.
+pub enum AcmeCsrScheme
+    // ECDSA over P-256 with SHA-256 — the default, and the one this
+    // package's key vocabulary covers.
+    AcmeCsrEcdsaP256Sha256
+    // RSASSA-PKCS1-v1_5 with SHA-256, for a caller whose key is RSA.
+    AcmeCsrRsaSha256
+
+// The exact bytes a certification request's signature is taken over:
+// the DER `CertificationRequestInfo`.
+//
+// The names go in the subjectAltName extension and the subject is
+// empty.  The public key is a DER SubjectPublicKeyInfo — asn1-nv's
+// `write_spki` and `ec_spki` produce one from a P-256 key.
+pub fn csr_info(names: [Str], spki: Bytes, limit: Int) -> Result<Bytes, AcmeCsrFault> []
+    todo("acme-nv.acmecsr.csr_info")
+
+// The whole certification request, from the info bytes and a signature
+// over them.
+//
+// The signature is in the scheme's certificate encoding — DER
+// `SEQUENCE { r, s }` for ECDSA — and NOT the fixed-width form a JWS
+// carries.  `AcmeCsrBadSignature` names that when the length says the
+// wrong one arrived.
+pub fn csr(info: Bytes, scheme: AcmeCsrScheme, signature: Bytes) -> Result<Bytes, AcmeCsrFault> []
+    todo("acme-nv.acmecsr.csr")
+
+// A certification request as a finalise payload carries it: base64url
+// of the DER, without padding.
+pub fn csr_text(der: Bytes) -> Str []
+    todo("acme-nv.acmecsr.csr_text")
+
+// The DNS names a certification request asks for, out of its SAN
+// extension.
+//
+// The SAN and not the subject, for the reason at the top of this
+// module.
+pub fn names_of(der: Bytes) -> Result<[Str], AcmeCsrFault> []
+    todo("acme-nv.acmecsr.names_of")
+
+// Whether a certification request's names are exactly an order's
+// identifiers — no more and no fewer, in any order.
+//
+// Public so a caller can check BEFORE finalising, because an order
+// refused at finalise is `invalid` and cannot be retried: the whole
+// issuance starts again, including the challenges.
+pub fn names_match(der: Bytes, identifiers: [AcmeIdentifier]) -> Result<Bool, AcmeCsrFault> []
+    todo("acme-nv.acmecsr.names_match")
+
+// The first name the two disagree about, for a caller that wants to
+// report rather than retry.
+pub fn first_name_disagreement(der: Bytes,
+                               identifiers: [AcmeIdentifier]) -> Result<?AcmeCsrFault, AcmeCsrFault> []
+    todo("acme-nv.acmecsr.first_name_disagreement")
+
+// The names an order asks a certificate for, in the form a
+// certification request writes them.
+//
+// A wildcard identifier becomes the dNSName `*.example.com` — the SAN
+// carries the star, which is the one place in this flow where the
+// wildcard is written literally.
+pub fn names_for_order(order: AcmeOrder) -> Result<[Str], AcmeCsrFault> []
+    todo("acme-nv.acmecsr.names_for_order")
+
+// Whether a DNS name may go in a SAN.
+pub fn name_is_wellformed(name: Str) -> Bool []
+    todo("acme-nv.acmecsr.name_is_wellformed")
+
+// The signature scheme's OID text, for a caller that has to report
+// what it built.
+pub fn scheme_oid_text(scheme: AcmeCsrScheme) -> Str []
+    todo("acme-nv.acmecsr.scheme_oid_text")
+
+// How long a signature of this scheme is, for the check `csr` performs.
+//
+// 0 for RSA, whose signature length is the key's rather than the
+// algorithm's — so the check is skipped rather than guessed.
+pub fn signature_len_for(scheme: AcmeCsrScheme) -> Int []
+    todo("acme-nv.acmecsr.signature_len_for")
+
+// What went wrong building a certificate request, in one line.
+//
+// ```novo ignore
+// use acmecsr
+//
+// fn report(e: AcmeCsrFault) -> Str
+//     e.message()
+// ```
+impl Error for AcmeCsrFault
+    fn message(self) -> Str
+        todo("acme-nv.acmecsr.AcmeCsrFault.message")
