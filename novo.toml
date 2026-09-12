@@ -1,6 +1,6 @@
 [package]
 name        = "acme-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "An ACME client (RFC 8555): account creation, orders, the HTTP-01 and DNS-01 challenges as values a caller serves itself, CSR generation over asn1-nv, finalisation, certificate download and renewal planning.  The message shapes and the JWS signing are sans-IO; the client is a thin pump over std.http.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
