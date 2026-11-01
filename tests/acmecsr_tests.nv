@@ -1,0 +1,315 @@
+// acmecsr_tests.nv — the certification request.
+//
+// The fixtures are requests made by Python's `cryptography` package
+// (a P-256 request with a wildcard, one whose only name is the
+// subject, one whose first extension is not the subjectAltName, and an
+// RSA one), so reading is checked against another implementation.  A
+// request this package builds is read back here and is verified by the
+// same package in acmeclient_tests, at finalisation.
+
+use std.test
+use std.bytes
+use std.list
+use acmecsr
+use acmejws
+use acmemsg
+use asn1oid
+use asn1pkix
+use hashing
+use p256
+
+// CN absent, subjectAltName = a.example.com and *.example.com.
+fn ec_request() -> Bytes
+    bytes.from_hex("3081f430819c02010030003059301306072a8648ce3d020106082a8648ce3d03010703420004da165c54af354ed93610223a46b2e9db62e8dc97c809d7eeb65f6e962eb58357937731a15191cd1a3989961ba6483af508b4c25eeb6f366c54ec712eb171c2c7a03a303806092a864886f70d01090e312b302930270603551d110420301e820d612e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d300a06082a8648ce3d040302034700304402205512e0b4a79df47133a7362e53bef7f80491e7b8fa8e9c5d7f37207411d74b6302207c43f87f230393a89e49b1ab3f6f8550f08d881f72a6014904f89a1335921ab4") ?? bytes.zeros(0)
+
+// Subject CN = only-in-subject.test, no extensions.
+fn subject_only_request() -> Bytes
+    bytes.from_hex("3081db308181020100301f311d301b06035504030c146f6e6c792d696e2d7375626a6563742e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004da165c54af354ed93610223a46b2e9db62e8dc97c809d7eeb65f6e962eb58357937731a15191cd1a3989961ba6483af508b4c25eeb6f366c54ec712eb171c2c7a000300a06082a8648ce3d04030203490030460221008d07528c1d00a21d87cd469401abf67355cee491397e629ddea834701fc10f91022100af9ecbacc5126065ea21715154d7529171673e2880bcf2738c0148b41bc52967") ?? bytes.zeros(0)
+
+// BasicConstraints first, then subjectAltName = 192.0.2.1 and b.example.com.
+fn mixed_request() -> Bytes
+    bytes.from_hex("3081fa3081a102010030003059301306072a8648ce3d020106082a8648ce3d03010703420004da165c54af354ed93610223a46b2e9db62e8dc97c809d7eeb65f6e962eb58357937731a15191cd1a3989961ba6483af508b4c25eeb6f366c54ec712eb171c2c7a03f303d06092a864886f70d01090e3130302e300c0603551d130101ff04023000301e0603551d11041730158704c0000201820d622e6578616d706c652e636f6d300a06082a8648ce3d0403020348003045022077c0cc2ef4b1bdd37f4bb38f8915c231c250103d4ac2a53bb83de9b69b24a622022100ce518d725f150f6942c716f3dc93cc570c80924732e38443dc98c04b47b3e536") ?? bytes.zeros(0)
+
+// An RSA-2048 request for r.example.com.
+fn rsa_request() -> Bytes
+    bytes.from_hex("3082027030820158020100300030820122300d06092a864886f70d01010105000382010f003082010a0282010100b60e975591c83bbca43db7c711766a057b596247faba809db031c3e6d7365e6078a39afd814d677fdf8398a352d9608aad4f6b2e442ed33f1c165e4b56ebbe46a5c2848b7f60e40b632014541464e6d8c1dea6a607be453fd1921efc98281215f32b97f7552c423a1f816411ff1b7ca85962b70c237e415188ad7b196b9d721b4376cd703a090cce4791ed68e3da3093147a5613a98c6f2c2a7ff28a1e9881d7ef32ae0b14641d8361e25a51012c00090aa3b418c3bb654c9324b49b599d84e1c6e605a0c39aee3f7c3e45b906baae6646ae351ebf09cce887cdfbd698445853d113383a1eecdd38b874256f43a187576d01268eaaa5322067e584343a4ca2b70203010001a02b302906092a864886f70d01090e311c301a30180603551d110411300f820d722e6578616d706c652e636f6d300d06092a864886f70d01010b05000382010100136d2c38f74e3120915a143144ed6f328f8184710449eb68f492ae17f18d281ffbccf58167169924da65792f8966ca5c6d6ca98eb9f72ccac54153900eee407e7b2465f56a7f94edb5b9da98baeb473f8be5ceb97614a3d500e3c1bab865bfc6c430a357833a96bdb79ee9ccc34954f4bd159b5bbf83c1fa2d3b83df97313a075858927c44e1fbc5e51dd9e11dd2ab6463ff90f2256d197db50db63241f5e72337ce8b1c158107a32c199ba957c7be82b061f9c38d5b2c420be3ee1b5d925d0e682353da180e7c795f102033f702792e6adb8bd0da52a3a733cea651f5f9462adde9034a9c0086349607ca56b5c1df4e2d149be37a0a8a99e3631d0f738f6563") ?? bytes.zeros(0)
+
+fn ids(names: [Str]) -> [AcmeIdentifier]
+    var out: [AcmeIdentifier] = []
+    for n in names
+        list.push(out, acmemsg.dns_identifier(n))
+    out
+
+fn an_order(names: [Str]) -> AcmeOrder
+    AcmeOrder { url: "u", status: AcmeOrderReady, expires: "", identifiers: ids(names), authorizations: [],
+                finalize: "f", certificate: "", not_before: "", not_after: "", problem: None }
+
+// The key of RFC 7515 appendix A.3.
+fn bytes_of(text: Str) -> Bytes
+    match acmejws.base64url_decode(text)
+        Ok(b)  => b
+        Err(_) => bytes.zeros(0)
+
+fn spki() -> Bytes
+    match asn1pkix.ec_spki(asn1oid.oid_prime256v1(), bytes_of("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"),
+                           bytes_of("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+        Err(_) => bytes.zeros(0)
+        Ok(k)  =>
+            match asn1pkix.write_spki(k)
+                Ok(der) => der
+                Err(_)  => bytes.zeros(0)
+
+// ECDSA over the info bytes, in the DER form a certificate carries.
+fn der_signature(info: Bytes) -> Bytes
+    match p256.secret_key_from_bytes(bytes.to_byte_list(bytes_of("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI")))
+        Err(_) => bytes.zeros(0)
+        Ok(sk) =>
+            match p256.ecdsa_sign(sk, bytes.to_byte_list(hashing.sha256(info)))
+                Err(_) => bytes.zeros(0)
+                Ok(rs) =>
+                    let raw = bytes.from_byte_list(rs)
+                    match asn1pkix.ecdsa_signature_der(bytes.slice(raw, 0, 32), bytes.slice(raw, 32, 64))
+                        Ok(der) => der
+                        Err(_)  => bytes.zeros(0)
+
+fn names_text(r: Result<[Str], AcmeCsrFault>) -> Str
+    match r
+        Ok(names) => list.join(names, ",")
+        Err(e)    => e.message()
+
+@test
+fn test_names_are_read_from_the_san_and_never_the_subject() [io]
+    test.case("a request with a wildcard")
+    test.assert_eq_str(names_text(acmecsr.names_of(ec_request())), "a.example.com,*.example.com")
+
+    test.case("a subject with no extension request names nothing")
+    test.assert_eq_str(names_text(acmecsr.names_of(subject_only_request())), "")
+
+    test.case("the subjectAltName is found after another extension, and an IP entry is not a name")
+    test.assert_eq_str(names_text(acmecsr.names_of(mixed_request())), "b.example.com")
+
+    test.case("an RSA request reads the same way")
+    test.assert_eq_str(names_text(acmecsr.names_of(rsa_request())), "r.example.com")
+
+    test.case("bytes that are not a request are refused with an offset")
+    test.assert(str.contains(names_text(acmecsr.names_of(bytes.zeros(0))), "malformed"))
+    test.assert(str.contains(names_text(acmecsr.names_of(bytes.from_hex("3000") ?? bytes.zeros(0))), "malformed"))
+    test.assert(str.contains(names_text(acmecsr.names_of(bytes.from_hex("3003020100") ?? bytes.zeros(0))), "malformed"))
+
+@test
+fn test_names_must_match_the_order_exactly() [io]
+    let both = ["a.example.com", "*.example.com"]
+    test.case("any order, any case")
+    match acmecsr.names_match(ec_request(), ids(["*.EXAMPLE.com", "a.example.com"]))
+        Ok(same) => test.assert(same)
+        Err(_)   => test.fail("a request that reads")
+
+    test.case("a repeated identifier counts once")
+    match acmecsr.names_match(ec_request(), ids(["a.example.com", "*.example.com", "a.example.com"]))
+        Ok(same) => test.assert(same)
+        Err(_)   => test.fail("a request that reads")
+
+    test.case("a name the request lacks is reported as in the order")
+    match acmecsr.first_name_disagreement(ec_request(), ids(["a.example.com", "*.example.com", "c.example.com"]))
+        Ok(Some(f)) =>
+            match f
+                AcmeCsrNamesDisagree(name, in_order) =>
+                    test.assert_eq_str(name, "c.example.com")
+                    test.assert(in_order)
+                    test.assert(str.contains(f.message(), "the order asks for"))
+                _                                    => test.fail("the fault names the name")
+        Ok(None)    => test.fail("c.example.com is missing from the request")
+        Err(_)      => test.fail("a request that reads")
+    match acmecsr.names_match(ec_request(), ids(["a.example.com", "*.example.com", "c.example.com"]))
+        Ok(same) => test.assert(not same)
+        Err(_)   => test.fail("a request that reads")
+
+    test.case("a name the order lacks is reported as in the request")
+    match acmecsr.first_name_disagreement(ec_request(), ids(["a.example.com"]))
+        Ok(Some(f)) =>
+            match f
+                AcmeCsrNamesDisagree(name, in_order) =>
+                    test.assert_eq_str(name, "*.example.com")
+                    test.assert(not in_order)
+                    test.assert(str.contains(f.message(), "the request asks for"))
+                _                                    => test.fail("the fault names the name")
+        Ok(None)    => test.fail("*.example.com is extra")
+        Err(_)      => test.fail("a request that reads")
+
+    test.case("no disagreement")
+    match acmecsr.first_name_disagreement(ec_request(), ids(both))
+        Ok(Some(_)) => test.fail("they agree")
+        Ok(None)    => test.assert(true)
+        Err(_)      => test.fail("a request that reads")
+
+    test.case("unreadable DER is the fault, not a mismatch")
+    match acmecsr.first_name_disagreement(bytes.zeros(0), [])
+        Ok(_)  => test.fail("no bytes")
+        Err(_) => test.assert(true)
+    match acmecsr.names_match(bytes.zeros(0), ids(both))
+        Ok(_)  => test.fail("no bytes")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_request_with_no_attributes_names_nothing() [io]
+    // A request whose info has version, subject and key but no [0]
+    // attribute member, which is how a request with no extensions can
+    // be written.
+    let key = spki()
+    let info = bytes.concat([bytes.from_hex("3060020100" + "3000") ?? bytes.zeros(0), key])
+    match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, der_signature(info))
+        Err(_)  => test.fail("the info is a SEQUENCE")
+        Ok(der) => test.assert_eq_str(names_text(acmecsr.names_of(der)), "")
+
+@test
+fn test_a_name_for_a_san() [io]
+    test.case("ordinary names, a wildcard and a single label")
+    for good in ["example.com",
+    "a-b.example.com",
+    "*.example.com",
+    "localhost",
+    "xn--bcher-kva.example",
+    "EXAMPLE.com",
+    "1.example.com"]
+        test.assert(acmecsr.name_is_wellformed(good))
+
+    test.case("empty labels, a trailing dot, a misplaced star, hyphens at the edge, other characters, length")
+    for bad in ["", "*.", "*", "a..b", ".a", "a.", "a.*.b", "**.example.com", "-a.example.com", "a-.example.com",
+                "a_b.example.com", "a b.example.com", "bücher.example", "*.*.example.com"]
+        test.assert(not acmecsr.name_is_wellformed(bad))
+    test.assert(not acmecsr.name_is_wellformed(str.repeat("a", 64) + ".com"))
+    test.assert(acmecsr.name_is_wellformed(str.repeat("a", 63) + ".com"))
+    test.assert(not acmecsr.name_is_wellformed(str.repeat(str.repeat("a", 60) + ".", 5) + "com"))
+
+    test.case("the names an order asks for keep the star")
+    match acmecsr.names_for_order(an_order(["*.example.com", "example.com"]))
+        Ok(names) => test.assert_eq_str(list.join(names, ","), "*.example.com,example.com")
+        Err(_)    => test.fail("a wildcard order has names")
+    match acmecsr.names_for_order(an_order(["bad..name"]))
+        Ok(_)  => test.fail("not a name")
+        Err(e) =>
+            match e
+                AcmeCsrNotADnsName(v) => test.assert_eq_str(v, "bad..name")
+                _                     => test.fail("the fault names the value")
+    match acmecsr.names_for_order(an_order([]))
+        Ok(_)  => test.fail("no names")
+        Err(e) =>
+            match e
+                AcmeCsrNoNames => test.assert_eq_str(e.message(), "the request names nothing")
+                _              => test.fail("the fault says there were none")
+    let ip_order = AcmeOrder { url: "u", status: AcmeOrderReady, expires: "",
+                               identifiers: [AcmeIdentifier { kind: AcmeIpIdentifier, value: "192.0.2.1" }],
+                               authorizations: [], finalize: "f", certificate: "", not_before: "",
+                               not_after: "", problem: None }
+    match acmecsr.names_for_order(ip_order)
+        Ok(_)  => test.fail("an IP is not a SAN dNSName here")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_built_request_reads_back_and_its_signature_verifies() [io]
+    test.case("the subject is empty, and says so")
+    test.assert(acmecsr.ACME_CSR_SUBJECT_IS_EMPTY)
+
+    match acmecsr.csr_info(["b.example.com", "*.example.com", "x.test"], spki(), 100)
+        Err(_)   => test.fail("three names and a P-256 key")
+        Ok(info) =>
+            test.case("the info is a SEQUENCE: version 0, an empty Name, the key, then the attribute")
+            test.assert_eq(bytes.byte_at(info, 0) ?? 0, 48)
+            test.assert(str.starts_with(bytes.to_hex(info), "3081") or str.starts_with(bytes.to_hex(info), "3082"))
+            test.assert(str.contains(bytes.to_hex(info), "020100" + "3000" + "3059"))
+
+            test.case("the whole request carries the ecdsa-with-SHA256 algorithm and reads back")
+            match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, der_signature(info))
+                Err(_)  => test.fail("a DER signature of the right shape")
+                Ok(der) =>
+                    test.assert_eq_str(acmecsr.scheme_oid_text(AcmeCsrEcdsaP256Sha256), "1.2.840.10045.4.3.2")
+                    test.assert(str.contains(bytes.to_hex(der), "06082a8648ce3d040302"))
+                    test.assert_eq_str(names_text(acmecsr.names_of(der)), "b.example.com,*.example.com,x.test")
+                    match acmecsr.names_match(der, ids(["x.test", "*.example.com", "b.example.com"]))
+                        Ok(same) => test.assert(same)
+                        Err(_)   => test.fail("it reads")
+                    test.assert_eq_str(acmecsr.csr_text(der), acmejws.base64url(der))
+
+    test.case("a long name takes the long-form DER length")
+    let long = str.repeat("a", 60) + "." + str.repeat("b", 60) + "." + str.repeat("c", 60) + "." + str.repeat("d", 60) + ".com"
+    match acmecsr.csr_info([long], spki(), 100)
+        Err(_)   => test.fail("a 249-byte name")
+        Ok(info) =>
+            match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, der_signature(info))
+                Err(_)  => test.fail("signature")
+                Ok(der) => test.assert_eq_str(names_text(acmecsr.names_of(der)), long)
+
+    test.case("an RSA scheme names its OID and takes any non-empty signature")
+    test.assert_eq_str(acmecsr.scheme_oid_text(AcmeCsrRsaSha256), "1.2.840.113549.1.1.11")
+    test.assert_eq(acmecsr.signature_len_for(AcmeCsrRsaSha256), 0)
+    test.assert_eq(acmecsr.signature_len_for(AcmeCsrEcdsaP256Sha256), 64)
+    match acmecsr.csr_info(["r.test"], spki(), 100)
+        Err(_)   => test.fail("info")
+        Ok(info) =>
+            match acmecsr.csr(info, AcmeCsrRsaSha256, bytes.zeros(256))
+                Ok(der) => test.assert(str.contains(bytes.to_hex(der), "06092a864886f70d01010b0500"))
+                Err(_)  => test.fail("an RSA signature has the key's width")
+            match acmecsr.csr(info, AcmeCsrRsaSha256, bytes.zeros(0))
+                Ok(_)  => test.fail("no signature")
+                Err(e) => test.assert(str.contains(e.message(), "empty"))
+
+@test
+fn test_building_refuses_what_the_server_would() [io]
+    test.case("no names, too many names, a name that is not one")
+    match acmecsr.csr_info([], spki(), 100)
+        Ok(_)  => test.fail("a certificate for nothing")
+        Err(e) =>
+            match e
+                AcmeCsrNoNames => test.assert(true)
+                _              => test.fail("the fault says there were no names")
+    match acmecsr.csr_info(["a.test", "b.test"], spki(), 1)
+        Ok(_)  => test.fail("two against a limit of one")
+        Err(e) =>
+            match e
+                AcmeCsrTooManyNames(count, limit) =>
+                    test.assert_eq(count, 2)
+                    test.assert_eq(limit, 1)
+                    test.assert_eq_str(e.message(), "2 names exceeds the limit of 1")
+                _                                 => test.fail("the fault carries both numbers")
+    match acmecsr.csr_info(["bad..name"], spki(), 100)
+        Ok(_)  => test.fail("not a name")
+        Err(e) => test.assert_eq_str(e.message(), "`bad..name` is not a DNS name for a subjectAltName")
+
+    test.case("a key that is not a SubjectPublicKeyInfo")
+    match acmecsr.csr_info(["a.test"], bytes.zeros(64), 100)
+        Ok(_)  => test.fail("64 zero bytes")
+        Err(e) =>
+            match e
+                AcmeCsrBadPublicKey => test.assert_eq_str(e.message(), "the public key is not a SubjectPublicKeyInfo")
+                _                   => test.fail("the fault says the key is wrong")
+
+    test.case("the info must be a SEQUENCE")
+    match acmecsr.csr(bytes.zeros(8), AcmeCsrEcdsaP256Sha256, bytes.zeros(8))
+        Ok(_)  => test.fail("eight bytes is not a request")
+        Err(e) => test.assert(str.contains(e.message(), "malformed"))
+    match acmecsr.csr(bytes.zeros(0), AcmeCsrEcdsaP256Sha256, bytes.zeros(8))
+        Ok(_)  => test.fail("no bytes")
+        Err(_) => test.assert(true)
+
+    match acmecsr.csr_info(["a.test"], spki(), 100)
+        Err(_)   => test.fail("info")
+        Ok(info) =>
+            test.case("a signature of the JWS width is the fixed-width form, and the fault says so")
+            match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, bytes.zeros(64))
+                Ok(_)  => test.fail("r then s is not DER")
+                Err(e) =>
+                    match e
+                        AcmeCsrBadSignature(detail) => test.assert(str.contains(detail, "fixed-width"))
+                        _                           => test.fail("the fault says the signature is wrong")
+
+            test.case("any other non-DER signature is just not DER")
+            match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, bytes.zeros(8))
+                Ok(_)  => test.fail("eight bytes")
+                Err(e) => test.assert(str.contains(e.message(), "not a DER SEQUENCE"))
+
+            test.case("a SEQUENCE that is not exactly r and s")
+            match acmecsr.csr(info,
+                AcmeCsrEcdsaP256Sha256,
+                bytes.from_hex("3009020101020102020103") ?? bytes.zeros(0))
+                Ok(_)  => test.fail("three integers")
+                Err(e) => test.assert(str.contains(e.message(), "exactly r and s"))

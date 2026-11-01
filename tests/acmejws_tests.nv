@@ -1,0 +1,326 @@
+// acmejws_tests.nv — the request signature, the JWK and its thumbprint.
+//
+// The thumbprint is checked against RFC 7638 section 3.1's published
+// value for an RSA key, and against SHA-256 computed outside this
+// package for the P-256 key of RFC 7515 appendix A.3.  The signature
+// is verified with p256-nv's verifier here and, in acmeclient_tests,
+// by Python's `cryptography` package in the test server.
+
+use std.test
+use std.bytes
+use std.list
+use acmejws
+use hashing
+use jwtalg
+use p256
+
+// RFC 7638 section 3.1.
+fn rsa_jwk() -> Str
+    "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\"}"
+
+// The P-256 key of RFC 7515 appendix A.3.
+fn ec_jwk() -> Str
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+
+fn bytes_of(text: Str) -> Bytes
+    match acmejws.base64url_decode(text)
+        Ok(b)  => b
+        Err(_) => bytes.zeros(0)
+
+fn ec_public() -> ?p256.PublicKey
+    match p256.public_key_from_bytes(bytes.to_byte_list(bytes_of("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU")),
+                                     bytes.to_byte_list(bytes_of("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0")))
+        Ok(k)  => Some(k)
+        Err(_) => None
+
+// Signs with the private key of RFC 7515 appendix A.3.
+fn sign_with_a3(input: Bytes) -> ?Bytes
+    match p256.secret_key_from_bytes(bytes.to_byte_list(bytes_of("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI")))
+        Err(_) => None
+        Ok(sk) =>
+            match p256.ecdsa_sign(sk, bytes.to_byte_list(hashing.sha256(input)))
+                Err(_)  => None
+                Ok(sig) => Some(bytes.from_byte_list(sig))
+
+fn refuse_to_sign(input: Bytes) -> ?Bytes
+    None
+
+fn der_shaped(input: Bytes) -> ?Bytes
+    Some(bytes.zeros(70))
+
+fn short_rsa_signature(input: Bytes) -> ?Bytes
+    Some(bytes.zeros(0))
+
+@test
+fn test_the_thumbprint_of_rfc_7638() [io]
+    test.case("RFC 7638 section 3.1 publishes the thumbprint of its RSA key")
+    match acmejws.thumbprint_text(rsa_jwk())
+        Ok(t)  => test.assert_eq_str(t, "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs")
+        Err(_) => test.fail("that is canonical form")
+
+    test.case("the P-256 key's thumbprint is the SHA-256 computed outside this package")
+    match acmejws.thumbprint_text(ec_jwk())
+        Ok(t)  => test.assert_eq_str(t, "oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U")
+        Err(_) => test.fail("that is canonical form")
+
+    test.case("the raw digest fills the caller's buffer")
+    match acmejws.thumbprint(ec_jwk(), bytes.zeros(32))
+        Ok(t)  => test.assert_eq(bytes.len(t), 32)
+        Err(_) => test.fail("32 bytes hold SHA-256")
+
+    test.case("a buffer that is too small is refused with both widths")
+    match acmejws.thumbprint(ec_jwk(), bytes.zeros(8))
+        Ok(_)  => test.fail("8 bytes cannot hold a digest")
+        Err(e) =>
+            match e
+                AcmeJwsBufferTooSmall(got, want) =>
+                    test.assert_eq(got, 8)
+                    test.assert_eq(want, 32)
+                    test.assert(str.contains(e.message(), "output buffer is 8 bytes"))
+                _                                => test.fail("the fault names the buffer")
+
+@test
+fn test_a_jwk_that_is_not_canonical_is_refused_rather_than_hashed() [io]
+    test.case("members out of order")
+    match acmejws.thumbprint_text("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AAAA\",\"y\":\"BBBB\"}")
+        Ok(_)  => test.fail("the member order is part of the construction")
+        Err(e) =>
+            match e
+                AcmeJwsJwkNotCanonical(_) => test.assert(true)
+                _                         => test.fail("the fault says the JWK is not canonical")
+
+    test.case("whitespace")
+    match acmejws.thumbprint_text("{\"crv\": \"P-256\",\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"BBBB\"}")
+        Ok(_)  => test.fail("one space changes the digest")
+        Err(e) =>
+            match e
+                AcmeJwsJwkNotCanonical(_) => test.assert(true)
+                _                         => test.fail("the fault says the JWK is not canonical")
+
+    test.case("an extra member")
+    match acmejws.thumbprint_text("{\"crv\":\"P-256\",\"kid\":\"k\",\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"BBBB\"}")
+        Ok(_)  => test.fail("only the required members are hashed")
+        Err(e) => test.assert_eq_str(e.message(),
+            "the JWK is not in RFC 7638 canonical form: the key has a member its type does not need")
+
+    test.case("a missing member")
+    match acmejws.thumbprint_text("{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"AAAA\"}")
+        Ok(_)  => test.fail("y is required")
+        Err(e) => test.assert(str.contains(e.message(), "`y`"))
+
+    test.case("a text that is not JSON, not an object, or a key type this package does not know")
+    match acmejws.thumbprint_text("not json")
+        Ok(_)  => test.fail("not JSON")
+        Err(e) => test.assert(str.contains(e.message(), "not JSON"))
+    match acmejws.thumbprint_text("[1]")
+        Ok(_)  => test.fail("not an object")
+        Err(e) => test.assert(str.contains(e.message(), "not a JSON object"))
+    match acmejws.thumbprint_text("{\"kty\":\"oct\",\"k\":\"AAAA\"}")
+        Ok(_)  => test.fail("a symmetric key is not an ACME account key")
+        Err(e) =>
+            match e
+                AcmeJwsUnsupportedKey => test.assert_eq_str(e.message(), "the key cannot be written as a JWK")
+                _                     => test.fail("the fault says the key type is unsupported")
+
+@test
+fn test_the_jwk_comes_from_the_key_and_is_canonical() [io]
+    match ec_public()
+        None      => test.fail("the RFC 7515 key has two 32-byte coordinates")
+        Some(key) =>
+            test.case("the coordinates are written as base64url in canonical order")
+            match acmejws.jwk_of_ec(key)
+                Ok(j)  => test.assert_eq_str(j, ec_jwk())
+                Err(_) => test.fail("that point is on the curve")
+
+    test.case("a point that is not on the curve has no JWK")
+    match p256.public_key_from_bytes(bytes.to_byte_list(bytes.zeros(32)), bytes.to_byte_list(bytes.zeros(32)))
+        Err(_)  => test.fail("two 32-byte coordinates are the right shape")
+        Ok(bad) =>
+            match acmejws.jwk_of_ec(bad)
+                Ok(_)  => test.fail("(0, 0) is not on P-256")
+                Err(e) =>
+                    match e
+                        AcmeJwsUnsupportedKey => test.assert(true)
+                        _                     => test.fail("the fault says the key is unsupported")
+
+@test
+fn test_the_key_authorization_and_its_dns_digest() [io]
+    // The token is the one RFC 8555 section 8.1 shows.  The expected
+    // strings were computed with Python's hashlib.
+    let token = "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA"
+    test.case("token, a dot, and the thumbprint")
+    match acmejws.key_authorization(token, ec_jwk())
+        Ok(k)  => test.assert_eq_str(k,
+            "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA.oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U")
+        Err(_) => test.fail("a token and a canonical JWK are a key authorization")
+
+    test.case("a JWK that is not canonical gives no key authorization")
+    match acmejws.key_authorization(token, "{}")
+        Ok(_)  => test.fail("an empty object is not a key")
+        Err(_) => test.assert(true)
+
+@test
+fn test_base64url_carries_no_padding() [io]
+    test.case("one byte encodes to two characters, not four")
+    test.assert_eq(str.len(acmejws.base64url(bytes.zeros(1))), 2)
+
+    test.case("the URL alphabet, not the standard one")
+    test.assert_eq_str(acmejws.base64url(bytes.from_hex("fbff") ?? bytes.zeros(0)), "-_8")
+
+    test.case("it decodes back")
+    match acmejws.base64url_decode(acmejws.base64url(bytes.from_str("abc")))
+        Ok(b)  => test.assert_eq_str(bytes.to_str(b), "abc")
+        Err(_) => test.fail("what it encoded, it decodes")
+
+    test.case("padding and foreign characters are refused")
+    match acmejws.base64url_decode("YQ==")
+        Ok(_)  => test.fail("RFC 7515 strips the padding")
+        Err(e) => test.assert_eq_str(e.message(), "the text is not base64url without padding")
+    match acmejws.base64url_decode("a+b")
+        Ok(_)  => test.fail("+ is the standard alphabet")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_read_has_an_empty_payload_and_a_nonce_is_a_value() [io]
+    test.case("a read sends nothing at all")
+    test.assert_eq_str(acmejws.post_as_get_payload(), "")
+
+    test.case("a nonce carries its text and nothing else")
+    test.assert_eq_str(acmejws.nonce_value(acmejws.nonce("oFvnlFP1wIhRlYS2jTaXbA")), "oFvnlFP1wIhRlYS2jTaXbA")
+
+@test
+fn test_the_protected_header_names_the_key_one_way() [io]
+    let n = acmejws.nonce("n-1")
+    test.case("a kid header has four members in order")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-order",
+                                   AcmeJwsKid("https://example.com/acme/acct/1"))
+        Ok(h)  => test.assert_eq_str(h,
+            "{\"alg\":\"ES256\",\"nonce\":\"n-1\",\"url\":\"https://example.com/acme/new-order\",\"kid\":\"https://example.com/acme/acct/1\"}")
+        Err(_) => test.fail("a kid header is the ordinary case")
+
+    test.case("a jwk header embeds the key as an object")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-acct", AcmeJwsJwk(ec_jwk()))
+        Ok(h)  =>
+            test.assert(str.contains(h, "\"jwk\":{\"crv\":\"P-256\",\"kty\":\"EC\""))
+            test.assert(not str.contains(h, "kid"))
+        Err(_) => test.fail("a canonical JWK is a header")
+
+    test.case("an empty kid is refused, naming the request")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-order", AcmeJwsKid(""))
+        Ok(_)  => test.fail("a request needs an account URL")
+        Err(e) =>
+            match e
+                AcmeJwsWrongKeyId(request, _) => test.assert_eq_str(request, "https://example.com/acme/new-order")
+                _                             => test.fail("the fault names the request")
+
+    test.case("a jwk that is not canonical is refused")
+    match acmejws.protected_header(Es256, n, "https://example.com/acme/new-acct", AcmeJwsJwk("{}"))
+        Ok(_)  => test.fail("an empty object is not a key")
+        Err(_) => test.assert(true)
+
+    test.case("a symmetric algorithm may not sign")
+    test.assert(not acmejws.algorithm_allowed(Hs256))
+    test.assert(acmejws.algorithm_allowed(Rs256))
+    match acmejws.protected_header(Hs256, n, "https://example.com/x", AcmeJwsKid("k"))
+        Ok(_)  => test.fail("HS256 is a shared secret")
+        Err(e) => test.assert_eq_str(e.message(), "the algorithm HS256 may not sign an ACME request")
+
+@test
+fn test_a_signed_request_verifies_under_the_public_key() [io]
+    let target = "https://example.com/acme/new-order"
+    match acmejws.signed_request(sign_with_a3, Es256, acmejws.nonce("n-1"), target,
+                                 AcmeJwsKid("https://example.com/acme/acct/1"), "{\"identifiers\":[]}")
+        Err(_)   => test.fail("a signer that answers signs")
+        Ok(body) =>
+            match json.parse(body)
+                None    => test.fail("the body is JSON")
+                Some(v) =>
+                    test.case("flattened: three members, no padding, nothing else")
+                    test.assert_eq(list.len(json.keys(v)), 3)
+                    let protected = json.get_str(v, "protected") ?? ""
+                    let payload = json.get_str(v, "payload") ?? ""
+                    let signature = json.get_str(v, "signature") ?? ""
+                    test.assert(not str.contains(protected + payload + signature, "="))
+                    test.assert_eq_str(payload, acmejws.base64url(bytes.from_str("{\"identifiers\":[]}")))
+
+                    test.case("the signature is the fixed-width r then s over header.payload")
+                    test.assert_eq(bytes.len(bytes_of(signature)), 64)
+                    match ec_public()
+                        None      => test.fail("key")
+                        Some(key) =>
+                            let input = protected + "." + payload
+                            match p256.ecdsa_verify(key, bytes.to_byte_list(hashing.sha256(bytes.from_str(input))),
+                                                    bytes.to_byte_list(bytes_of(signature)))
+                                Ok(good) => test.assert(good)
+                                Err(_)   => test.fail("a 64-byte signature and a 32-byte digest are checkable")
+
+    test.case("the signing input is the two encodings joined by a dot")
+    test.assert_eq_str(acmejws.signing_input("{}", "{}"), "e30.e30")
+
+@test
+fn test_rfc_7515_appendix_a3_signature_verifies_through_flattened() [io]
+    // The signature RFC 7515 prints for its A.3 example, wrapped by
+    // `flattened` and checked against the public key in the RFC.
+    let protected = "{\"alg\":\"ES256\"}"
+    let sig = bytes_of("DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+    test.assert_eq(bytes.len(sig), 64)
+    match acmejws.flattened(protected,
+        "{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}",
+        sig)
+        Err(_) => test.fail("a 64-byte ES256 signature is the right length")
+        Ok(b)  =>
+            test.assert(str.contains(b,
+                "\"signature\":\"DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q\""))
+            test.assert(str.contains(b, "\"protected\":\"eyJhbGciOiJFUzI1NiJ9\""))
+
+@test
+fn test_signing_refusals_name_what_went_wrong() [io]
+    let target = "https://example.com/acme/new-order"
+    let kid = AcmeJwsKid("https://example.com/acme/acct/1")
+
+    test.case("a signer that answers None signs nothing")
+    match acmejws.signed_request(refuse_to_sign, Es256, acmejws.nonce("n"), target, kid, "{}")
+        Ok(_)  => test.fail("no signature")
+        Err(e) =>
+            match e
+                AcmeJwsSignatureRefused => test.assert_eq_str(e.message(), "the signing function declined to sign")
+                _                       => test.fail("the fault says the signer refused")
+
+    test.case("a DER-sized signature is refused with both lengths: a JWS wants r then s")
+    match acmejws.signed_request(der_shaped, Es256, acmejws.nonce("n"), target, kid, "{}")
+        Ok(_)  => test.fail("70 bytes is not 64")
+        Err(e) =>
+            match e
+                AcmeJwsSignatureWrongLength(got, want) =>
+                    test.assert_eq(got, 70)
+                    test.assert_eq(want, 64)
+                    test.assert(str.contains(e.message(), "not DER"))
+                _                                      => test.fail("the fault carries both lengths")
+
+    test.case("an empty RSA signature is refused, a non-empty one has no fixed width")
+    match acmejws.signed_request(short_rsa_signature, Rs256, acmejws.nonce("n"), target, kid, "{}")
+        Ok(_)  => test.fail("no signature")
+        Err(_) => test.assert(true)
+    match acmejws.flattened("{\"alg\":\"RS256\"}", "{}", bytes.zeros(256))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("RS256 signatures take the key's width")
+
+    test.case("HS256 never reaches the signer")
+    match acmejws.signed_request(sign_with_a3, Hs256, acmejws.nonce("n"), target, kid, "{}")
+        Ok(_)  => test.fail("HS256 is symmetric")
+        Err(e) =>
+            match e
+                AcmeJwsAlgorithmNotAllowed(name) => test.assert_eq_str(name, "HS256")
+                _                                => test.fail("the fault names the algorithm")
+
+    test.case("a header naming an algorithm ACME does not allow is refused by flattened")
+    match acmejws.flattened("{\"alg\":\"HS256\"}", "{}", bytes.zeros(32))
+        Ok(_)  => test.fail("HS256")
+        Err(_) => test.assert(true)
+    match acmejws.flattened("not json", "{}", bytes.zeros(64))
+        Ok(_)  => test.fail("no algorithm")
+        Err(_) => test.assert(true)
+
+    test.case("wrong key id messages")
+    test.assert(str.contains(AcmeJwsWrongKeyId("u", "a kid").message(), "needs a kid"))
+    test.assert(str.contains(AcmeJwsNotBase64Url.message(), "base64url"))

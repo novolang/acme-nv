@@ -1,0 +1,207 @@
+// acmerenew_tests.nv — when to renew, and the timestamps and delays
+// around it.
+
+use std.test
+use civil
+use acmemsg
+use acmerenew
+
+fn at(y: Int, m: Int, d: Int) -> CivilDateTime
+    match civil.date(y, m, d)
+        Ok(dd) => civil.datetime(dd, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn at_hour(y: Int, m: Int, d: Int, h: Int) -> CivilDateTime
+    match civil.date(y, m, d)
+        Ok(dd) =>
+            match civil.time_of(h, 0, 0, 0)
+                Ok(t)  => civil.datetime(dd, t)
+                Err(_) => civil.datetime(dd, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn renews(nb: CivilDateTime, na: CivilDateTime, now: CivilDateTime, p: AcmeRenewalPolicy) -> Bool
+    match acmerenew.should_renew(nb, na, now, p)
+        Ok(yes) => yes
+        Err(_)  => false
+
+fn an_order(status: AcmeOrderStatus, expires: Str) -> AcmeOrder
+    AcmeOrder { url: "u", status: status, expires: expires, identifiers: [], authorizations: [], finalize: "f",
+                certificate: "", not_before: "", not_after: "", problem: None }
+
+@test
+fn test_renewal_is_a_fraction_of_the_lifetime() [io]
+    test.case("the published policy: two thirds, a floor of seven days, a day of spread")
+    test.assert_eq(acmerenew.ACME_RENEW_AT_NUMERATOR, 2)
+    test.assert_eq(acmerenew.ACME_RENEW_AT_DENOMINATOR, 3)
+    let p = acmerenew.default_policy()
+    test.assert_eq(p.least_days_left, 7)
+    test.assert_eq(p.window_hours, 24)
+
+    let starts = at(2026, 7, 1)
+    let ends = at(2026, 9, 29)
+    test.case("a ninety-day certificate: a third in is too early, two thirds in is not")
+    test.assert(not renews(starts, ends, at(2026, 7, 30), p))
+    test.assert(not renews(starts, ends, at(2026, 8, 29), p))
+    test.assert(renews(starts, ends, at(2026, 8, 30), p))
+    test.assert(renews(starts, ends, at(2026, 9, 1), p))
+
+    test.case("the window opens at two thirds and is a day wide")
+    match acmerenew.renewal_window(starts, ends, p)
+        Err(_) => test.fail("a ninety-day lifetime has a window")
+        Ok(w)  =>
+            test.assert_eq(civil.compare_datetime(w.opens, at(2026, 8, 30)), 0)
+            test.assert_eq(civil.compare_datetime(w.closes, at(2026, 8, 31)), 0)
+
+    test.case("a six-day certificate renews from its first day, because the floor is longer than its life")
+    match acmerenew.renewal_window(at(2026, 7, 1), at(2026, 7, 7), p)
+        Err(_) => test.fail("a six-day lifetime has a window")
+        Ok(w)  => test.assert_eq(civil.compare_datetime(w.opens, at(2026, 7, 1)), 0)
+
+    test.case("a long certificate renews at the floor when two thirds would be later")
+    match acmerenew.with_fraction(p, 99, 100)
+        Err(_) => test.fail("99/100 is a fraction")
+        Ok(q)  =>
+            match acmerenew.renewal_window(at(2026, 1, 1), at(2027, 1, 1), q)
+                Err(_) => test.fail("a year")
+                Ok(w)  => test.assert_eq(civil.compare_datetime(w.opens, at(2026, 12, 25)), 0)
+
+    test.case("the window never closes after expiry")
+    match acmerenew.renewal_window(starts, ends, acmerenew.with_window_hours(p, 24000))
+        Err(_) => test.fail("a wide window")
+        Ok(w)  => test.assert_eq(civil.compare_datetime(w.closes, ends), 0)
+
+    test.case("the window width is the policy's")
+    match acmerenew.renewal_window(starts, ends, acmerenew.with_window_hours(p, 12))
+        Err(_) => test.fail("a half-day window")
+        Ok(w)  => test.assert_eq(civil.compare_datetime(w.closes, at_hour(2026, 8, 30, 12)), 0)
+
+    test.case("a window wider than the calendar is a fault, not a wrapped date")
+    match acmerenew.renewal_window(starts, ends, acmerenew.with_window_hours(p, 9000000000000))
+        Ok(_)  => test.fail("beyond the range of years")
+        Err(e) =>
+            match e
+                AcmeRenewDateOutOfRange => test.assert(str.contains(e.message(), "range of years"))
+                _                       => test.fail("the fault says the date left the range")
+
+@test
+fn test_an_expired_certificate_is_the_strongest_yes() [io]
+    let p = acmerenew.default_policy()
+    test.case("past expiry still says renew")
+    test.assert(renews(at(2026, 1, 1), at(2026, 4, 1), at(2026, 9, 12), p))
+
+    test.case("days left are negative past expiry, whole days toward the past")
+    test.assert_eq(acmerenew.days_left(at(2026, 4, 1), at(2026, 9, 12)), -164)
+    test.assert_eq(acmerenew.days_left(at(2026, 4, 1), at_hour(2026, 4, 1, 1)), -1)
+    test.assert_eq(acmerenew.days_left(at(2026, 4, 1), at(2026, 4, 1)), 0)
+    test.assert_eq(acmerenew.days_left(at(2026, 4, 11), at(2026, 4, 1)), 10)
+    test.assert_eq(acmerenew.days_left(at(2026, 4, 11), at_hour(2026, 4, 1, 12)), 9)
+
+@test
+fn test_the_policy_and_its_arithmetic() [io]
+    let p = acmerenew.default_policy()
+    test.case("a fraction must lie strictly between zero and one")
+    for pair in [(5, 3), (3, 3), (0, 3), (-1, 3), (1, 0), (1, -2)]
+        match acmerenew.with_fraction(p, pair.0, pair.1)
+            Ok(_)  => test.fail("not a fraction of a lifetime")
+            Err(e) =>
+                match e
+                    AcmeRenewBadFraction(n, d) =>
+                        test.assert_eq(n, pair.0)
+                        test.assert_eq(d, pair.1)
+                        test.assert(str.contains(e.message(), "strictly between zero and one"))
+                    _                          => test.fail("the fault carries the numbers")
+    match acmerenew.with_fraction(p, 1, 2)
+        Ok(q)  => test.assert_eq(q.at_denominator, 2)
+        Err(_) => test.fail("a half is a fraction")
+    test.assert_eq(acmerenew.with_least_days_left(p, 10).least_days_left, 10)
+    test.assert_eq(acmerenew.with_window_hours(p, 12).window_hours, 12)
+
+    test.case("lifetime in days and the share used")
+    match acmerenew.lifetime_days(at(2026, 7, 1), at(2026, 9, 29))
+        Ok(d)  => test.assert_eq(d, 90)
+        Err(_) => test.fail("ninety days")
+    match acmerenew.lifetime_used_percent(at(2026, 7, 1), at(2026, 9, 29), at(2026, 7, 1))
+        Ok(pc) => test.assert_eq(pc, 0)
+        Err(_) => test.fail("the start")
+    match acmerenew.lifetime_used_percent(at(2026, 7, 1), at(2026, 7, 11), at(2026, 7, 6))
+        Ok(pc) => test.assert_eq(pc, 50)
+        Err(_) => test.fail("halfway")
+    match acmerenew.lifetime_used_percent(at(2026, 7, 1), at(2026, 7, 11), at(2026, 6, 1))
+        Ok(pc) => test.assert_eq(pc, 0)
+        Err(_) => test.fail("before the start is none of it")
+    match acmerenew.lifetime_used_percent(at(2026, 7, 1), at(2026, 7, 11), at(2026, 9, 1))
+        Ok(pc) => test.assert_eq(pc, 100)
+        Err(_) => test.fail("after the end is all of it")
+
+    test.case("a certificate that does not end after it starts has no lifetime")
+    match acmerenew.lifetime_days(at(2026, 7, 1), at(2026, 7, 1))
+        Ok(_)  => test.fail("zero days")
+        Err(e) =>
+            match e
+                AcmeRenewInvertedLifetime => test.assert(str.contains(e.message(), "does not expire after"))
+                _                         => test.fail("the fault says inverted")
+    match acmerenew.renewal_window(at(2026, 7, 2), at(2026, 7, 1), p)
+        Ok(_)  => test.fail("inverted")
+        Err(_) => test.assert(true)
+    match acmerenew.should_renew(at(2026, 7, 2), at(2026, 7, 1), at(2026, 7, 1), p)
+        Ok(_)  => test.fail("inverted")
+        Err(_) => test.assert(true)
+    match acmerenew.lifetime_used_percent(at(2026, 7, 2), at(2026, 7, 1), at(2026, 7, 1))
+        Ok(_)  => test.fail("inverted")
+        Err(_) => test.assert(true)
+
+@test
+fn test_timestamps_off_the_wire() [io]
+    test.case("Z, fractions, and an offset converted to UTC")
+    match acmerenew.parse_timestamp("expires", "2016-01-05T14:09:07.99Z")
+        Ok(t)  =>
+            test.assert_eq(t.date.day, 5)
+            test.assert_eq(t.time.hour, 14)
+        Err(_) => test.fail("that is RFC 3339")
+    match acmerenew.parse_timestamp("expires", "2016-01-05T14:09:07+02:00")
+        Ok(t)  => test.assert_eq(t.time.hour, 12)
+        Err(_) => test.fail("that is RFC 3339")
+    match acmerenew.parse_timestamp("expires", "2016-01-01T01:00:00+02:00")
+        Ok(t)  =>
+            test.assert_eq(t.date.year, 2015)
+            test.assert_eq(t.date.day, 31)
+        Err(_) => test.fail("that is RFC 3339")
+
+    test.case("a timestamp that is not RFC 3339 quotes itself and the field")
+    match acmerenew.parse_timestamp("notAfter", "next tuesday")
+        Ok(_)  => test.fail("not a date")
+        Err(e) =>
+            match e
+                AcmeRenewBadTimestamp(field, value) =>
+                    test.assert_eq_str(field, "notAfter")
+                    test.assert_eq_str(value, "next tuesday")
+                    test.assert(str.contains(e.message(), "`notAfter` holds `next tuesday`"))
+                _                                   => test.fail("the fault quotes the text")
+
+    test.case("an order's and an authorization's expiry")
+    match acmerenew.order_expires_at(an_order(AcmeOrderPending, "2026-10-01T00:00:00Z"))
+        Ok(t)  => test.assert_eq(t.date.month, 10)
+        Err(_) => test.fail("an RFC 3339 expiry")
+    match acmerenew.order_expires_at(an_order(AcmeOrderPending, ""))
+        Ok(_)  => test.fail("no expiry")
+        Err(_) => test.assert(true)
+    let authz = AcmeAuthorization { url: "a", identifier: acmemsg.dns_identifier("example.com"), status: AcmeAuthzValid,
+                                    expires: "2026-10-01T00:00:00Z", wildcard: false, challenges: [] }
+    match acmerenew.authorization_expires_at(authz)
+        Ok(t)  => test.assert_eq(t.date.month, 10)
+        Err(_) => test.fail("an RFC 3339 expiry")
+
+@test
+fn test_an_order_can_arrive_satisfied_and_polling_backs_off() [io]
+    test.case("only ready needs no challenge")
+    test.assert(acmerenew.order_needs_no_challenge(an_order(AcmeOrderReady, "")))
+    test.assert(not acmerenew.order_needs_no_challenge(an_order(AcmeOrderPending, "")))
+
+    test.case("the backoff doubles up to a minute")
+    test.assert_eq(acmerenew.poll_backoff_seconds(-3), 1)
+    test.assert_eq(acmerenew.poll_backoff_seconds(0), 1)
+    test.assert_eq(acmerenew.poll_backoff_seconds(1), 2)
+    test.assert_eq(acmerenew.poll_backoff_seconds(4), 16)
+    test.assert_eq(acmerenew.poll_backoff_seconds(5), 32)
+    test.assert_eq(acmerenew.poll_backoff_seconds(6), 60)
+    test.assert_eq(acmerenew.poll_backoff_seconds(1000), 60)

@@ -1,0 +1,461 @@
+// acmemsg_tests.nv — the objects an ACME server serves.
+//
+// The documents are the examples in RFC 8555 sections 6.7.1 and 7.1,
+// with `'` standing for `"` so they read as JSON.
+
+use std.test
+use std.list
+use acmemsg
+
+fn q(text: Str) -> Str
+    str.replace_all(text, "'", "\"")
+
+fn limits() -> AcmeMsgLimits
+    acmemsg.default_limits()
+
+fn directory_doc() -> Str
+    q("{'newNonce':'https://example.com/acme/new-nonce','newAccount':'https://example.com/acme/new-account','newOrder':'https://example.com/acme/new-order','newAuthz':'https://example.com/acme/new-authz','revokeCert':'https://example.com/acme/revoke-cert','keyChange':'https://example.com/acme/key-change','meta':{'termsOfService':'https://example.com/acme/terms/2017-5-30','website':'https://www.example.com/','caaIdentities':['example.com'],'externalAccountRequired':true}}")
+
+fn order_doc() -> Str
+    q("{'status':'pending','expires':'2016-01-05T14:09:07.99Z','notBefore':'2016-01-01T00:00:00Z','notAfter':'2016-01-08T00:00:00Z','identifiers':[{'type':'dns','value':'www.example.org'},{'type':'dns','value':'*.example.org'},{'type':'ip','value':'192.0.2.1'},{'type':'email','value':'a@example.org'}],'authorizations':['https://example.com/acme/authz/PAniVnsZcis','https://example.com/acme/authz/r4HqLzrSrpI'],'finalize':'https://example.com/acme/order/TOlocE8rfgo/finalize'}")
+
+fn authz_doc() -> Str
+    q("{'status':'valid','expires':'2015-03-01T14:09:07.99Z','identifier':{'type':'dns','value':'example.org'},'challenges':[{'url':'https://example.com/acme/chall/prV_B7yEyA4','type':'http-01','status':'valid','token':'DGyRejmCefe7v4NfDGDKfA','validated':'2014-12-01T12:05:58.16Z'},{'url':'https://example.com/acme/chall/dns','type':'dns-01','status':'pending','token':'tok'},{'url':'https://example.com/acme/chall/alpn','type':'tls-alpn-01','status':'processing','token':'tok'},{'url':'https://example.com/acme/chall/x','type':'x-new-01','status':'invalid','token':'tok','error':{'type':'urn:ietf:params:acme:error:unauthorized','detail':'no','status':403}}],'wildcard':true}")
+
+fn fault_text(r: Result<AcmeAccount, AcmeMsgFault>) -> Str
+    match r
+        Ok(_)  => "accepted"
+        Err(e) => e.message()
+
+@test
+fn test_the_directory_of_rfc_8555() [io]
+    match acmemsg.parse_directory(directory_doc(), limits())
+        Err(_) => test.fail("the RFC's own example")
+        Ok(d)  =>
+            test.case("the URLs a client needs")
+            test.assert_eq_str(d.new_nonce, "https://example.com/acme/new-nonce")
+            test.assert_eq_str(d.new_account, "https://example.com/acme/new-account")
+            test.assert_eq_str(d.new_order, "https://example.com/acme/new-order")
+            test.assert_eq_str(d.revoke_cert, "https://example.com/acme/revoke-cert")
+            test.assert_eq_str(d.key_change, "https://example.com/acme/key-change")
+
+            test.case("the metadata")
+            test.assert_eq_str(d.terms_of_service, "https://example.com/acme/terms/2017-5-30")
+            test.assert_eq_str(d.website, "https://www.example.com/")
+            test.assert_eq(list.len(d.caa_identities), 1)
+            test.assert(d.external_account_required)
+
+    test.case("meta is optional, and so is keyChange")
+    match acmemsg.parse_directory(q("{'newNonce':'a','newAccount':'b','newOrder':'c','revokeCert':'d'}"), limits())
+        Err(_) => test.fail("four URLs are a directory")
+        Ok(d)  =>
+            test.assert_eq_str(d.key_change, "")
+            test.assert_eq_str(d.terms_of_service, "")
+            test.assert(not d.external_account_required)
+
+    test.case("a missing URL names itself")
+    match acmemsg.parse_directory(q("{'newNonce':'a','newAccount':'b','newOrder':'c'}"), limits())
+        Ok(_)  => test.fail("revokeCert is required")
+        Err(e) => test.assert_eq_str(e.message(), "the member `revokeCert` is missing")
+
+    test.case("meta that is not an object")
+    match acmemsg.parse_directory(q("{'newNonce':'a','newAccount':'b','newOrder':'c','revokeCert':'d','meta':3}"), limits())
+        Ok(_)  => test.fail("meta is an object")
+        Err(e) => test.assert_eq_str(e.message(), "the member `meta` is not object")
+
+@test
+fn test_the_account_order_and_authorization_of_rfc_8555() [io]
+    test.case("an account, whose URL is the Location header and not a member")
+    match acmemsg.parse_account(q("{'status':'valid','contact':['mailto:cert-admin@example.org','mailto:admin@example.org'],'termsOfServiceAgreed':true,'orders':'https://example.com/acme/acct/evOfKhNU60wg/orders'}"),
+                                "https://example.com/acme/acct/evOfKhNU60wg", limits())
+        Err(_) => test.fail("the RFC's own example")
+        Ok(a)  =>
+            test.assert_eq_str(a.url, "https://example.com/acme/acct/evOfKhNU60wg")
+            test.assert_eq(list.len(a.contact), 2)
+            test.assert(a.terms_agreed)
+            test.assert_eq_str(a.orders, "https://example.com/acme/acct/evOfKhNU60wg/orders")
+            match a.status
+                AcmeAccountValid => test.assert(true)
+                _                => test.fail("valid")
+
+    test.case("the other two account states")
+    match acmemsg.parse_account(q("{'status':'deactivated'}"), "u", limits())
+        Ok(a)  =>
+            match a.status
+                AcmeAccountDeactivated => test.assert(true)
+                _                      => test.fail("deactivated")
+        Err(_) => test.fail("a status is enough")
+    match acmemsg.parse_account(q("{'status':'revoked'}"), "u", limits())
+        Ok(a)  =>
+            match a.status
+                AcmeAccountRevoked => test.assert(true)
+                _                  => test.fail("revoked")
+        Err(_) => test.fail("a status is enough")
+
+    test.case("an order with every kind of identifier")
+    match acmemsg.parse_order(order_doc(), "https://example.com/acme/order/TOlocE8rfgo", limits())
+        Err(_) => test.fail("the RFC's own example, with two more identifiers")
+        Ok(o)  =>
+            test.assert_eq_str(o.url, "https://example.com/acme/order/TOlocE8rfgo")
+            test.assert_eq_str(o.expires, "2016-01-05T14:09:07.99Z")
+            test.assert_eq_str(o.not_before, "2016-01-01T00:00:00Z")
+            test.assert_eq_str(o.not_after, "2016-01-08T00:00:00Z")
+            test.assert_eq_str(o.finalize, "https://example.com/acme/order/TOlocE8rfgo/finalize")
+            test.assert_eq_str(o.certificate, "")
+            test.assert_eq(list.len(o.authorizations), 2)
+            test.assert_eq(list.len(o.identifiers), 4)
+            test.assert(acmemsg.is_wildcard(o.identifiers[1]))
+            match o.identifiers[2].kind
+                AcmeIpIdentifier => test.assert(true)
+                _                => test.fail("ip")
+            match o.identifiers[3].kind
+                AcmeUnknownIdentifier(name) => test.assert_eq_str(name, "email")
+                _                           => test.fail("unknown")
+            match o.status
+                AcmeOrderPending => test.assert(true)
+                _                => test.fail("pending")
+
+    test.case("every order status the RFC defines")
+    for pair in [("ready", 1), ("processing", 2), ("valid", 3), ("invalid", 4)]
+        let doc = q("{'status':'") + pair.0 + q("','identifiers':[{'type':'dns','value':'a.test'}],'authorizations':[],'finalize':'f','certificate':'c'}")
+        match acmemsg.parse_order(doc, "u", limits())
+            Err(_) => test.fail("a status the RFC defines")
+            Ok(o)  =>
+                match o.status
+                    AcmeOrderReady      => test.assert_eq(pair.1, 1)
+                    AcmeOrderProcessing => test.assert_eq(pair.1, 2)
+                    AcmeOrderValid      => test.assert_eq(pair.1, 3)
+                    AcmeOrderInvalid    => test.assert_eq(pair.1, 4)
+                    AcmeOrderPending    => test.fail("not pending")
+
+    test.case("an invalid order carries its problem")
+    match acmemsg.parse_order(q("{'status':'invalid','identifiers':[{'type':'dns','value':'a.test'}],'authorizations':[],'finalize':'f','error':{'type':'urn:ietf:params:acme:error:unauthorized','detail':'nope'}}"),
+        "u",
+        limits())
+        Err(_) => test.fail("an error member is allowed")
+        Ok(o)  =>
+            match o.problem
+                None    => test.fail("the problem is kept")
+                Some(p) => test.assert_eq_str(acmemsg.problem_text(p), "nope")
+
+    test.case("an authorization for a wildcard carries the base name and every challenge kind")
+    match acmemsg.parse_authorization(authz_doc(), "https://example.com/acme/authz/1", limits())
+        Err(_) => test.fail("the RFC's example, with more challenges")
+        Ok(a)  =>
+            test.assert_eq_str(a.identifier.value, "example.org")
+            test.assert(a.wildcard)
+            test.assert_eq(list.len(a.challenges), 4)
+            test.assert_eq_str(a.challenges[0].validated, "2014-12-01T12:05:58.16Z")
+            match a.status
+                AcmeAuthzValid => test.assert(true)
+                _              => test.fail("valid")
+            match a.challenges[1].status
+                AcmeChallengePending => test.assert(true)
+                _                    => test.fail("pending")
+            match a.challenges[2].status
+                AcmeChallengeProcessing => test.assert(true)
+                _                       => test.fail("processing")
+            match a.challenges[3].status
+                AcmeChallengeInvalid => test.assert(true)
+                _                    => test.fail("invalid")
+            match a.challenges[3].problem
+                None    => test.fail("the error is kept")
+                Some(p) => test.assert_eq(p.status, 403)
+            match acmemsg.challenge_by_kind(a, AcmeUnknownChallenge("x-new-01"))
+                Some(c) => test.assert_eq_str(c.url, "https://example.com/acme/chall/x")
+                None    => test.fail("an unknown kind is found by its name")
+
+    test.case("the remaining authorization states")
+    for name in ["pending", "invalid", "deactivated", "expired", "revoked"]
+        match acmemsg.parse_authorization(q("{'status':'") + name + q("','identifier':{'type':'dns','value':'a.test'},'challenges':[]}"),
+            "u",
+            limits())
+            Err(_) => test.fail("a status the RFC defines")
+            Ok(a)  => test.assert_eq(acmemsg.is_terminal_authz(a.status), name != "pending")
+
+@test
+fn test_refusals_name_the_member() [io]
+    test.case("an empty body and a body that is not an object")
+    test.assert_eq_str(fault_text(acmemsg.parse_account("", "u", limits())), "the body is not a JSON object")
+    test.assert_eq_str(fault_text(acmemsg.parse_account("[1]", "u", limits())),
+        "the member `body` is not a JSON object")
+
+    test.case("a status the RFC does not define")
+    test.assert(str.contains(fault_text(acmemsg.parse_account(q("{'status':'sleeping'}"), "u", limits())), "`sleeping`"))
+    match acmemsg.parse_order(q("{'status':'sleeping','identifiers':[],'authorizations':[],'finalize':'f'}"), "u", limits())
+        Ok(_)  => test.fail("unknown status")
+        Err(e) =>
+            match e
+                AcmeMsgUnknownStatus(field, value) =>
+                    test.assert_eq_str(field, "status")
+                    test.assert_eq_str(value, "sleeping")
+                _                                  => test.fail("the fault names the field and the value")
+    match acmemsg.parse_authorization(q("{'status':'sleeping','identifier':{'type':'dns','value':'a'},'challenges':[]}"),
+        "u",
+        limits())
+        Ok(_)  => test.fail("unknown status")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_challenge(q("{'url':'u','type':'http-01','status':'sleeping'}"), limits())
+        Ok(_)  => test.fail("unknown status")
+        Err(_) => test.assert(true)
+
+    test.case("a member of the wrong kind")
+    test.assert_eq_str(fault_text(acmemsg.parse_account(q("{'status':3}"), "u", limits())),
+        "the member `status` is not a string")
+    test.assert_eq_str(fault_text(acmemsg.parse_account(q("{'status':'valid','termsOfServiceAgreed':'yes'}"), "u", limits())),
+        "the member `termsOfServiceAgreed` is not a boolean")
+    test.assert_eq_str(fault_text(acmemsg.parse_account(q("{'status':'valid','contact':'mailto:a@b'}"), "u", limits())),
+        "the member `contact` is not an array")
+    test.assert_eq_str(fault_text(acmemsg.parse_account(q("{'status':'valid','contact':[1]}"), "u", limits())),
+        "the member `contact` is not an array of strings")
+    test.assert_eq_str(fault_text(acmemsg.parse_account(q("{'status':null}"), "u", limits())),
+        "the member `status` is missing")
+    match acmemsg.parse_problem(q("{'type':'t','status':'403'}"), limits())
+        Ok(_)  => test.fail("status is a number")
+        Err(e) => test.assert_eq_str(e.message(), "the member `status` is not a number")
+    match acmemsg.parse_problem(q("{'subproblems':[3]}"), limits())
+        Ok(_)  => test.fail("a subproblem is an object")
+        Err(e) => test.assert_eq_str(e.message(), "the member `error` is not an object")
+
+    test.case("an identifier or a challenge that is not an object")
+    match acmemsg.parse_authorization(q("{'status':'pending','identifier':3,'challenges':[]}"), "u", limits())
+        Ok(_)  => test.fail("identifier is an object")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_authorization(q("{'status':'pending','challenges':[]}"), "u", limits())
+        Ok(_)  => test.fail("identifier is required")
+        Err(e) => test.assert_eq_str(e.message(), "the member `identifier` is missing")
+    match acmemsg.parse_authorization(q("{'status':'pending','identifier':{'type':'dns','value':'a'},'challenges':[3]}"),
+        "u",
+        limits())
+        Ok(_)  => test.fail("a challenge is an object")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_order(q("{'status':'pending','identifiers':[{'type':'dns'}],'authorizations':[],'finalize':'f'}"),
+        "u",
+        limits())
+        Ok(_)  => test.fail("an identifier has a value")
+        Err(e) => test.assert_eq_str(e.message(), "the member `value` is missing")
+
+    test.case("an order with no identifiers member at all")
+    match acmemsg.parse_order(q("{'status':'pending','authorizations':[],'finalize':'f'}"), "u", limits())
+        Ok(_)  => test.fail("identifiers are required")
+        Err(e) => test.assert_eq_str(e.message(), "the member `identifiers` is missing")
+
+    test.case("an order with no identifiers has no use")
+    match acmemsg.parse_order(q("{'status':'pending','identifiers':[],'authorizations':[],'finalize':'f'}"), "u", limits())
+        Ok(_)  => test.fail("no names")
+        Err(e) =>
+            match e
+                AcmeMsgNoIdentifiers => test.assert_eq_str(e.message(), "the identifier list is empty")
+                _                    => test.fail("the fault says there were none")
+
+@test
+fn test_a_hostile_server_is_held_to_the_limits() [io]
+    let small = AcmeMsgLimits { max_identifiers: 1, max_authorizations: 1, max_challenges: 1,
+                                max_subproblems: 1, max_body_bytes: 200 }
+    test.case("too many identifiers")
+    match acmemsg.parse_order(order_doc(), "u", AcmeMsgLimits { max_identifiers: 1, max_authorizations: 9,
+                                                                max_challenges: 9, max_subproblems: 9,
+                                                                max_body_bytes: 100000 })
+        Ok(_)  => test.fail("four identifiers against a limit of one")
+        Err(e) =>
+            match e
+                AcmeMsgTooMany(what, count, limit) =>
+                    test.assert_eq_str(what, "identifiers")
+                    test.assert_eq(count, 4)
+                    test.assert_eq(limit, 1)
+                    test.assert_eq_str(e.message(), "4 identifiers exceeds the limit of 1")
+                _                                  => test.fail("the fault carries the count and the limit")
+
+    test.case("a body longer than the byte limit")
+    match acmemsg.parse_order(order_doc(), "u", small)
+        Ok(_)  => test.fail("the body is longer than 200 bytes")
+        Err(e) =>
+            match e
+                AcmeMsgTooMany(what, _, _) => test.assert_eq_str(what, "body bytes")
+                _                          => test.fail("the fault names the body")
+
+    test.case("too many challenges and too many subproblems")
+    match acmemsg.parse_authorization(authz_doc(), "u", AcmeMsgLimits { max_identifiers: 9, max_authorizations: 9,
+                                                                        max_challenges: 1, max_subproblems: 9,
+                                                                        max_body_bytes: 100000 })
+        Ok(_)  => test.fail("four challenges against a limit of one")
+        Err(_) => test.assert(true)
+    match acmemsg.parse_problem(q("{'subproblems':[{},{}]}"), AcmeMsgLimits { max_identifiers: 9, max_authorizations: 9,
+                                                                              max_challenges: 9, max_subproblems: 1,
+                                                                              max_body_bytes: 100000 })
+        Ok(_)  => test.fail("two subproblems against a limit of one")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_problem_document_is_what_a_client_branches_on() [io]
+    test.case("badNonce is a retry and not a failure")
+    match acmemsg.parse_problem(q("{'type':'urn:ietf:params:acme:error:badNonce','detail':'JWS has an invalid anti-replay nonce','status':400}"),
+        limits())
+        Err(_) => test.fail("a well-formed problem")
+        Ok(p)  =>
+            test.assert(acmemsg.problem_is_bad_nonce(p))
+            test.assert(not acmemsg.problem_is_rate_limit(p))
+            test.assert(not acmemsg.problem_is_challenge_failure(p))
+            test.assert_eq_str(acmemsg.problem_kind(p), "urn:ietf:params:acme:error:badNonce")
+            test.assert_eq(p.status, 400)
+
+    test.case("rateLimited, unauthorized and incorrectResponse")
+    match acmemsg.parse_problem(q("{'type':'urn:ietf:params:acme:error:rateLimited'}"), limits())
+        Ok(p)  => test.assert(acmemsg.problem_is_rate_limit(p))
+        Err(_) => test.fail("a type is enough")
+    match acmemsg.parse_problem(q("{'type':'urn:ietf:params:acme:error:unauthorized'}"), limits())
+        Ok(p)  => test.assert(acmemsg.problem_is_challenge_failure(p))
+        Err(_) => test.fail("a type is enough")
+    match acmemsg.parse_problem(q("{'type':'urn:ietf:params:acme:error:incorrectResponse'}"), limits())
+        Ok(p)  => test.assert(acmemsg.problem_is_challenge_failure(p))
+        Err(_) => test.fail("a type is enough")
+
+    test.case("RFC 8555 section 6.7.1's subproblems")
+    match acmemsg.parse_problem(q("{'type':'urn:ietf:params:acme:error:malformed','detail':'Some of the identifiers requested were rejected','subproblems':[{'type':'urn:ietf:params:acme:error:malformed','detail':'Invalid underscore in DNS name','identifier':{'type':'dns','value':'_example.org'}},{'type':'urn:ietf:params:acme:error:rejectedIdentifier','detail':'This CA will not issue for example.net','subproblems':[{}]}]}"),
+        limits())
+        Err(_) => test.fail("the RFC's example")
+        Ok(p)  =>
+            test.assert_eq(list.len(p.subproblems), 2)
+            test.assert_eq_str(acmemsg.problem_text(p.subproblems[1]), "This CA will not issue for example.net")
+            test.assert_eq(list.len(p.subproblems[1].subproblems), 0)
+
+    test.case("the text for a person: the detail, else the title, else the URN's last segment")
+    test.assert_eq_str(acmemsg.problem_text(AcmeProblem { kind: "urn:x:y", title: "T", detail: "D", status: 0, subproblems: [] }),
+        "D")
+    test.assert_eq_str(acmemsg.problem_text(AcmeProblem { kind: "urn:x:y", title: "T", detail: "", status: 0, subproblems: [] }),
+        "T")
+    test.assert_eq_str(acmemsg.problem_text(AcmeProblem { kind: "urn:x:y", title: "", detail: "", status: 0, subproblems: [] }),
+        "y")
+    test.assert_eq_str(acmemsg.problem_text(AcmeProblem { kind: "", title: "", detail: "", status: 0, subproblems: [] }),
+        "")
+
+    test.case("a challenge that failed carries the sentence the operator can act on")
+    match acmemsg.parse_challenge(q("{'url':'u','type':'http-01','status':'invalid','token':'t','error':{'type':'urn:ietf:params:acme:error:unauthorized','detail':'Invalid response from http://example.com/.well-known/acme-challenge/t: 404','status':403}}"),
+        limits())
+        Err(_) => test.fail("a challenge")
+        Ok(c)  =>
+            match c.problem
+                None    => test.fail("the error is kept")
+                Some(p) => test.assert(str.contains(acmemsg.problem_text(p), "404"))
+
+@test
+fn test_the_writers() [io]
+    test.case("newAccount: contact, agreement, and onlyReturnExisting only when asked")
+    match acmemsg.write_new_account(["mailto:ops@example.com"], true, false)
+        Ok(b)  => test.assert_eq_str(b, q("{'contact':['mailto:ops@example.com'],'termsOfServiceAgreed':true}"))
+        Err(_) => test.fail("a contact and an agreement are a payload")
+    match acmemsg.write_new_account([], false, true)
+        Ok(b)  => test.assert_eq_str(b, q("{'onlyReturnExisting':true}"))
+        Err(_) => test.fail("onlyReturnExisting is a payload")
+    match acmemsg.write_new_account([""], true, false)
+        Ok(_)  => test.fail("an empty contact URL")
+        Err(e) => test.assert(str.contains(e.message(), "`contact`"))
+
+    test.case("newOrder: identifiers, and the window only when given")
+    match acmemsg.write_new_order([acmemsg.dns_identifier("example.com"), AcmeIdentifier { kind: AcmeIpIdentifier, value: "192.0.2.1" },
+                                   AcmeIdentifier { kind: AcmeUnknownIdentifier("x"), value: "v" }],
+                                   "", "")
+        Ok(b)  => test.assert_eq_str(b,
+            q("{'identifiers':[{'type':'dns','value':'example.com'},{'type':'ip','value':'192.0.2.1'},{'type':'x','value':'v'}]}"))
+        Err(_) => test.fail("identifiers are an order")
+    match acmemsg.write_new_order([acmemsg.dns_identifier("example.com")], "2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z")
+        Ok(b)  => test.assert_eq_str(b,
+            q("{'identifiers':[{'type':'dns','value':'example.com'}],'notBefore':'2026-01-01T00:00:00Z','notAfter':'2026-01-08T00:00:00Z'}"))
+        Err(_) => test.fail("a window is allowed")
+    match acmemsg.write_new_order([], "", "")
+        Ok(_)  => test.fail("an order has a name")
+        Err(e) =>
+            match e
+                AcmeMsgNoIdentifiers => test.assert(true)
+                _                    => test.fail("the fault says there were none")
+
+    test.case("finalise, revoke, ready and deactivate")
+    match acmemsg.write_finalize("AAAA")
+        Ok(b)  => test.assert_eq_str(b, q("{'csr':'AAAA'}"))
+        Err(_) => test.fail("a request is a finalise payload")
+    match acmemsg.write_finalize("")
+        Ok(_)  => test.fail("no request")
+        Err(e) => test.assert_eq_str(e.message(), "the member `csr` is missing")
+    match acmemsg.write_revoke("AAAA", 1)
+        Ok(b)  => test.assert_eq_str(b, q("{'certificate':'AAAA','reason':1}"))
+        Err(_) => test.fail("a certificate and a reason are a revocation")
+    match acmemsg.write_revoke("", 0)
+        Ok(_)  => test.fail("no certificate")
+        Err(_) => test.assert(true)
+    for bad in [7, -1, 11]
+        match acmemsg.write_revoke("AAAA", bad)
+            Ok(_)  => test.fail("not an RFC 5280 reason code")
+            Err(e) => test.assert(str.contains(e.message(), "reason"))
+    test.assert_eq_str(acmemsg.write_challenge_ready(), "{}")
+    test.assert_eq_str(acmemsg.write_deactivate(), q("{'status':'deactivated'}"))
+
+@test
+fn test_names_kinds_and_lookups() [io]
+    test.case("a wildcard identifier and its base name")
+    let star = acmemsg.dns_identifier("*.example.com")
+    test.assert(acmemsg.is_wildcard(star))
+    test.assert_eq_str(acmemsg.base_name(star), "example.com")
+    test.assert_eq_str(acmemsg.base_name(acmemsg.dns_identifier("example.com")), "example.com")
+    test.assert(not acmemsg.is_wildcard(acmemsg.dns_identifier("example.com")))
+
+    test.case("the challenge kind table round-trips")
+    test.assert_eq_str(acmemsg.challenge_kind_name(AcmeHttp01), "http-01")
+    test.assert_eq_str(acmemsg.challenge_kind_name(AcmeDns01), "dns-01")
+    test.assert_eq_str(acmemsg.challenge_kind_name(AcmeTlsAlpn01), "tls-alpn-01")
+    test.assert_eq_str(acmemsg.challenge_kind_name(AcmeUnknownChallenge("x")), "x")
+    match acmemsg.challenge_kind_of_name("http-01")
+        AcmeHttp01 => test.assert(true)
+        _          => test.fail("http-01")
+    match acmemsg.challenge_kind_of_name("dns-01")
+        AcmeDns01 => test.assert(true)
+        _         => test.fail("dns-01")
+    match acmemsg.challenge_kind_of_name("tls-alpn-01")
+        AcmeTlsAlpn01 => test.assert(true)
+        _             => test.fail("tls-alpn-01")
+    match acmemsg.challenge_kind_of_name("other")
+        AcmeUnknownChallenge(n) => test.assert_eq_str(n, "other")
+        _                       => test.fail("other")
+
+    test.case("terminal states")
+    test.assert(acmemsg.is_terminal_order(AcmeOrderValid))
+    test.assert(acmemsg.is_terminal_order(AcmeOrderInvalid))
+    test.assert(not acmemsg.is_terminal_order(AcmeOrderReady))
+    test.assert(not acmemsg.is_terminal_order(AcmeOrderPending))
+    test.assert(not acmemsg.is_terminal_order(AcmeOrderProcessing))
+    test.assert(acmemsg.is_terminal_authz(AcmeAuthzValid))
+    test.assert(not acmemsg.is_terminal_authz(AcmeAuthzPending))
+    test.assert(acmemsg.is_terminal_challenge(AcmeChallengeValid))
+    test.assert(acmemsg.is_terminal_challenge(AcmeChallengeInvalid))
+    test.assert(not acmemsg.is_terminal_challenge(AcmeChallengePending))
+    test.assert(not acmemsg.is_terminal_challenge(AcmeChallengeProcessing))
+
+    test.case("the authorization for a wildcard is found by base name and flag, never by string")
+    match acmemsg.parse_order(order_doc(), "u", limits())
+        Err(_)    => test.fail("order")
+        Ok(order) =>
+            let plain = AcmeAuthorization { url: "a", identifier: acmemsg.dns_identifier("www.example.org"),
+                                            status: AcmeAuthzPending, expires: "", wildcard: false, challenges: [] }
+            let star_authz = AcmeAuthorization { url: "b", identifier: acmemsg.dns_identifier("example.org"),
+                                                 status: AcmeAuthzPending, expires: "", wildcard: true, challenges: [] }
+            let stranger = AcmeAuthorization { url: "c", identifier: acmemsg.dns_identifier("example.org"),
+                                               status: AcmeAuthzPending, expires: "", wildcard: false, challenges: [] }
+            match acmemsg.identifier_for(order, plain)
+                Some(id) => test.assert_eq_str(id.value, "www.example.org")
+                None     => test.fail("the plain name")
+            match acmemsg.identifier_for(order, star_authz)
+                Some(id) => test.assert_eq_str(id.value, "*.example.org")
+                None     => test.fail("the wildcard")
+            match acmemsg.identifier_for(order, stranger)
+                Some(_) => test.fail("example.org was not ordered without the star")
+                None    => test.assert(true)
+
+    test.case("a challenge is found by kind, or not at all")
+    match acmemsg.parse_authorization(authz_doc(), "u", limits())
+        Err(_) => test.fail("authz")
+        Ok(a)  =>
+            match acmemsg.challenge_by_kind(a, AcmeDns01)
+                Some(c) => test.assert_eq_str(c.url, "https://example.com/acme/chall/dns")
+                None    => test.fail("dns-01 is offered")
+            match acmemsg.challenge_by_kind(a, AcmeUnknownChallenge("nope"))
+                Some(_) => test.fail("nope is not offered")
+                None    => test.assert(true)

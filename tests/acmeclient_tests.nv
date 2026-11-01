@@ -1,129 +1,869 @@
-// acmeclient_tests.nv — the one module in this package that performs
-// anything.
+// acmeclient_tests.nv — the client, against a local ACME server.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: acme-nv.acmeclient.<fn>`
-// before a socket is opened.
+// The first test starts tests/double/start.sh, which runs
+// tests/double/acme_double.py on an ephemeral port of 127.0.0.1, unless
+// ACME_DOUBLE already names a server.  The server is Python and checks
+// on the wire what the client sends with its own code: it verifies the
+// JWS signature with the `cryptography` package, rebuilds the key
+// authorization and the DNS digest with `hashlib`, parses the
+// certification request with `cryptography`'s x509 reader and checks
+// that its names equal the order's.  Nothing here reaches the network
+// beyond loopback.
 //
-// THE DIRECTORY URL THESE TESTS USE IS THE STAGING ONE, and that is the
-// habit the package wants a reader to pick up: every rate limit a
-// first-time user meets is one they would not have met against staging.
+// Run these tests from the package directory.
 
 use std.test
 use std.bytes
+use std.env
 use std.list
-use acmemsg
-use acmejws
+use std.process
+use acmecsr
+use acmechal
 use acmeclient
+use acmejws
+use acmemsg
+use asn1oid
+use asn1pkix
+use hashing
+use jwtalg
+use p256
 
-fn refuse_to_sign(input: Bytes) -> ?Bytes
+fn double() -> Str [io]
+    let named = env.get("ACME_DOUBLE") ?? ""
+    if named != ""
+        named
+    else
+        start_double()
+
+// A failed start answers a string that is not an address, so the first
+// request fails with it in the message.
+fn start_double() -> Str [io]
+    let (text, status) = process.run("sh tests/double/start.sh")
+    if status != 0
+        "the test ACME server did not start"
+    else
+        let address = str.trim(text)
+        process.env_set("ACME_DOUBLE", address)
+        address
+
+// Calls the server's control endpoints, which are not ACME.
+fn control(base: Str, path: Str, body: Str) -> Str [io, net, time, async]
+    match HttpClient.new(base).with_redirects(0).send("POST", base + path, bytes.from_str(body))
+        Ok(r)  => bytes.to_str(r.body)
+        Err(e) => http.client.error_text(e)
+
+fn ctl_get(base: Str, path: Str) -> Str [io, net, time, async]
+    control(base, path, "")
+
+// ── keys ─────────────────────────────────────────────────────────────
+
+fn bytes_of(text: Str) -> Bytes
+    match acmejws.base64url_decode(text)
+        Ok(b)  => b
+        Err(_) => bytes.zeros(0)
+
+fn sign_with(secret: Bytes, input: Bytes) -> ?Bytes
+    match p256.secret_key_from_bytes(bytes.to_byte_list(secret))
+        Err(_) => None
+        Ok(sk) =>
+            match p256.ecdsa_sign(sk, bytes.to_byte_list(hashing.sha256(input)))
+                Err(_)  => None
+                Ok(sig) => Some(bytes.from_byte_list(sig))
+
+// The account key is the P-256 key of RFC 7515 appendix A.3.
+fn account_secret() -> Bytes
+    bytes_of("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI")
+
+fn account_jwk() -> Str
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+
+fn sign_account(input: Bytes) -> ?Bytes
+    sign_with(account_secret(), input)
+
+// A second account key, which the server has never seen.
+fn other_secret() -> Bytes
+    bytes.from_hex("2222222222222222222222222222222222222222222222222222222222222222") ?? bytes.zeros(0)
+
+fn sign_other(input: Bytes) -> ?Bytes
+    sign_with(other_secret(), input)
+
+fn public_of(secret: Bytes) -> ?p256.PublicKey
+    match p256.secret_key_from_bytes(bytes.to_byte_list(secret))
+        Err(_) => None
+        Ok(sk) =>
+            match p256.key_pair_from_secret(sk)
+                Err(_) => None
+                Ok(kp) => Some(kp.public)
+
+fn other_jwk() -> Str
+    match public_of(other_secret())
+        None      => ""
+        Some(key) =>
+            match acmejws.jwk_of_ec(key)
+                Ok(j)  => j
+                Err(_) => ""
+
+// The certificate's own key, which signs the certification request.
+fn cert_secret() -> Bytes
+    bytes.from_hex("1111111111111111111111111111111111111111111111111111111111111111") ?? bytes.zeros(0)
+
+fn cert_spki() -> Bytes
+    match public_of(cert_secret())
+        None      => bytes.zeros(0)
+        Some(key) =>
+            match asn1pkix.ec_spki(asn1oid.oid_prime256v1(), bytes.from_byte_list(key.x), bytes.from_byte_list(key.y))
+                Err(_) => bytes.zeros(0)
+                Ok(k)  =>
+                    match asn1pkix.write_spki(k)
+                        Ok(der) => der
+                        Err(_)  => bytes.zeros(0)
+
+// The whole certification request for these names, signed with the
+// certificate key; the empty bytes when any step refuses.
+fn request_for(names: [Str]) -> Bytes
+    match acmecsr.csr_info(names, cert_spki(), 100)
+        Err(_)   => bytes.zeros(0)
+        Ok(info) =>
+            match sign_with(cert_secret(), info)
+                None      => bytes.zeros(0)
+                Some(raw) =>
+                    match asn1pkix.ecdsa_signature_der(bytes.slice(raw, 0, 32), bytes.slice(raw, 32, 64))
+                        Err(_)  => bytes.zeros(0)
+                        Ok(der) =>
+                            match acmecsr.csr(info, AcmeCsrEcdsaP256Sha256, der)
+                                Ok(csr) => csr
+                                Err(_)  => bytes.zeros(0)
+
+// The DER of the first certificate in a PEM chain.
+fn first_der(pem: Str) -> Bytes
+    var body = ""
+    var inside = false
+    var done = false
+    for line in str.lines(pem)
+        if str.starts_with(line, "-----END")
+            done = true
+        if inside and not done
+            body = body + str.trim(line)
+        if str.starts_with(line, "-----BEGIN")
+            inside = true
+    bytes.from_base64(body) ?? bytes.zeros(0)
+
+fn new_session(base: Str) -> Result<AcmeSession, AcmeClientFault> [io, net, time, async]
+    acmeclient.session(base + "/directory", acmeclient.signer(Es256, account_jwk(), sign_account))
+
+fn registered(base: Str) -> Result<(AcmeSession, AcmeNonce), AcmeClientFault> [io, net, time, async]
+    let s0 = new_session(base)!
+    let n0 = acmeclient.fresh_nonce(s0)!
+    let reg = acmeclient.new_account(s0, n0, ["mailto:ops@example.com"], true)!
+    Ok((reg.0, reg.2))
+
+fn no_challenge(what: Str) -> AcmeClientFault
+    AcmeClientUnexpectedStatus(what, 0)
+
+// What a whole issuance leaves behind.
+struct Issued
+    session: AcmeSession
+    nonce: AcmeNonce
+    order: AcmeOrder
+    pem: Str
+
+// Orders a certificate, answers every challenge of the kind asked for
+// by publishing at the server's control endpoint, finalises and
+// downloads.
+fn issue(base: Str, names: [Str],
+         prefer: AcmeChallengeKind) -> Result<Issued, AcmeClientFault> [io, net, time, async]
+    let r = registered(base)!
+    let s = r.0
+    var ids: [AcmeIdentifier] = []
+    for n in names
+        list.push(ids, acmemsg.dns_identifier(n))
+    let ordered = acmeclient.new_order(s, r.1, ids)!
+    var nonce = ordered.1
+    for authz_url in ordered.0.authorizations
+        let got = acmeclient.authorization(s, nonce, authz_url)!
+        nonce = got.1
+        match acmechal.preferred_challenge(got.0, prefer)
+            None    =>
+                return Err(no_challenge("no challenge this client can answer"))
+            Some(c) =>
+                match c.kind
+                    AcmeDns01 =>
+                        let name = text_or(acmechal.dns01_record_name(got.0.identifier.value), "")
+                        let value = text_or(acmechal.dns01_record_value(c.token, account_jwk()), "")
+                        let _ = control(base, "/ctl/dns01/" + name, value)
+                    _         =>
+                        let body = text_or(acmechal.http01_body(c.token, account_jwk()), "")
+                        let _ = control(base, "/ctl/http01/" + c.token, body)
+                let told = acmeclient.challenge_ready(s, nonce, c.url)!
+                nonce = told.1
+                let checked = acmeclient.poll_authorization(s, nonce, authz_url)!
+                nonce = checked.1
+    let ready = acmeclient.poll_order(s, nonce, ordered.0.url)!
+    let finalised = acmeclient.finalize(s, ready.1, ready.0.finalize, request_for(names))!
+    let downloaded = acmeclient.download_certificate(s, finalised.1, finalised.0.certificate)!
+    Ok(Issued { session: s, nonce: downloaded.1, order: finalised.0, pem: downloaded.0 })
+
+fn text_or(r: Result<Str, AcmeChalFault>, fallback: Str) -> Str
+    match r
+        Ok(t)  => t
+        Err(_) => fallback
+
+fn problem_kind_of(e: AcmeClientFault) -> Str
+    match e
+        AcmeClientProblem(p)        => acmemsg.problem_kind(p)
+        AcmeClientRateLimited(p, _) => acmemsg.problem_kind(p)
+        _                           => "not a problem: " + e.message()
+
+fn outcome(r: Result<Issued, AcmeClientFault>) -> Str
+    match r
+        Ok(_)  => "issued"
+        Err(e) => e.message()
+
+// ── the whole protocol ───────────────────────────────────────────────
+
+@test
+fn test_http01_issuance_end_to_end() [io, net, time, async]
+    let base = double()
+    control(base, "/ctl/reset-log", "")
+    match issue(base, ["http.example.test"], AcmeHttp01)
+        Err(e)     => test.fail("issuance refused: ${e.message()}")
+        Ok(issued) =>
+            test.case("the order is valid and names the certificate")
+            match issued.order.status
+                AcmeOrderValid => test.assert(true)
+                _              => test.fail("a finalised order is valid")
+            test.assert(str.starts_with(issued.order.certificate, base + "/cert/"))
+
+            test.case("the chain is PEM, a leaf and the test CA")
+            test.assert_eq(str.count(issued.pem, "-----BEGIN CERTIFICATE-----"), 2)
+
+            test.case("the certificate was issued for the name that was ordered")
+            test.assert(bytes.len(first_der(issued.pem)) > 100)
+
+            test.case("a download offers alternate chains, read from the Link header")
+            match acmeclient.post_as_get(issued.session, issued.nonce, issued.order.certificate)
+                Err(e) => test.fail("a second download: ${e.message()}")
+                Ok(x)  =>
+                    let alternates = acmeclient.alternate_chains(x)
+                    test.assert_eq(list.len(alternates), 2)
+                    test.assert(str.ends_with(alternates[0], "-alt1"))
+                    test.assert(not acmeclient.is_problem(x))
+                    test.assert_eq_str(x.link_up, "")
+
+            test.case("every read was a POST: the only GETs are the directory")
+            let trail = ctl_get(base, "/ctl/log")
+            test.assert(str.contains(trail, "[\"GET\", \"/directory\"]"))
+            test.assert(str.contains(trail, "[\"HEAD\", \"/nonce\"]"))
+            test.assert(not str.contains(trail, "\"GET\", \"/order"))
+            test.assert(not str.contains(trail, "\"GET\", \"/authz"))
+            test.assert(not str.contains(trail, "\"GET\", \"/chall"))
+            test.assert(not str.contains(trail, "\"GET\", \"/cert"))
+
+            test.case("the certificate can be revoked with the account key")
+            match acmeclient.revoke(issued.session, issued.nonce, first_der(issued.pem), 1)
+                Ok(_)  => test.assert(true)
+                Err(e) => test.fail("revocation refused: ${e.message()}")
+
+@test
+fn test_the_http01_body_is_what_the_server_computes_independently() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("oracle.example.test")])
+                Err(e)      => test.fail("order refused: ${e.message()}")
+                Ok(ordered) =>
+                    match acmeclient.authorization(r.0, ordered.1, ordered.0.authorizations[0])
+                        Err(e)  => test.fail("authorization refused: ${e.message()}")
+                        Ok(got) =>
+                            match acmechal.preferred_challenge(got.0, AcmeHttp01)
+                                None    => test.fail("HTTP-01 is offered for a plain name")
+                                Some(c) =>
+                                    let id = c.url
+                                    let number = str.slice(id, str.len(base) + str.len("/chall/"), str.len(id))
+                                    let expected = ctl_get(base, "/ctl/keyauth/" + number)
+                                    test.case("the key authorization equals Python's, to the byte")
+                                    test.assert_eq_str(text_or(acmechal.http01_body(c.token, account_jwk()), "-"),
+                                        expected)
+                                    test.case("and the DNS value is the digest of it")
+                                    test.assert_eq_str(text_or(acmechal.dns01_record_value(c.token, account_jwk()), "-"),
+                                                       acmejws.base64url(hashing.sha256(bytes.from_str(expected))))
+
+@test
+fn test_dns01_wildcard_issuance_needs_two_values_at_one_name() [io, net, time, async]
+    let base = double()
+    match issue(base, ["*.wild.example.test", "wild.example.test"], AcmeDns01)
+        Err(e)     => test.fail("issuance refused: ${e.message()}")
+        Ok(issued) =>
+            test.case("both authorizations were answered at the same record name")
+            test.assert_eq(list.len(issued.order.identifiers), 2)
+            test.assert(acmemsg.is_wildcard(issued.order.identifiers[0]))
+            test.assert_eq(str.count(issued.pem, "-----BEGIN CERTIFICATE-----"), 2)
+
+    test.case("HTTP-01 cannot answer the wildcard, so asking for it falls back to DNS-01")
+    match issue(base, ["*.wild2.example.test"], AcmeHttp01)
+        Err(e) => test.fail("the fallback should issue: ${e.message()}")
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_a_cached_authorization_arrives_ready() [io, net, time, async]
+    let base = double()
+    control(base, "/ctl/set", "{\"cached_authz\": 1}")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("cached.example.test")])
+                Err(e)      => test.fail("order refused: ${e.message()}")
+                Ok(ordered) =>
+                    test.case("nothing to publish, and finalise is next")
+                    test.assert(acmerenew_ready(ordered.0))
+
+fn acmerenew_ready(order: AcmeOrder) -> Bool
+    match order.status
+        AcmeOrderReady => true
+        _              => false
+
+@test
+fn test_bad_nonce_is_retried_once_and_a_second_is_surfaced() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            test.case("one badNonce is retried with the nonce from that very reply")
+            control(base, "/ctl/set", "{\"bad_nonce\": 1}")
+            control(base, "/ctl/reset-log", "")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("nonce1.example.test")])
+                Err(e)      => test.fail("one badNonce is not a failure: ${e.message()}")
+                Ok(ordered) =>
+                    test.assert(str.contains(ctl_get(base, "/ctl/log"), "[\"POST\", \"/order\"], [\"POST\", \"/order\"]"))
+
+                    test.case("two in a row are surfaced, naming the URL")
+                    control(base, "/ctl/set", "{\"bad_nonce\": 2}")
+                    match acmeclient.new_order(r.0, ordered.1, [acmemsg.dns_identifier("nonce2.example.test")])
+                        Ok(_)  => test.fail("two badNonce in a row")
+                        Err(e) =>
+                            match e
+                                AcmeClientNonceRetryExhausted(u) =>
+                                    test.assert_eq_str(u, base + "/order")
+                                    test.assert(str.contains(e.message(), "two nonces in a row"))
+                                _                                => test.fail("the fault says the retry was exhausted")
+
+@test
+fn test_a_nonce_is_single_use() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("reuse.example.test")])
+                Err(e) => test.fail("the first use: ${e.message()}")
+                Ok(_)  =>
+                    test.case("a spent nonce is refused by the server, and the client's single retry uses the fresh one")
+                    match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("reuse2.example.test")])
+                        Ok(_)  => test.assert(true)
+                        Err(e) => test.fail("the retry carries the nonce from the badNonce reply: ${e.message()}")
+
+@test
+fn test_problems_and_rate_limits() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            test.case("a rate limit carries the wait the server asked for")
+            control(base, "/ctl/set", "{\"rate_limit\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("limited.example.test")])
+                Ok(_)  => test.fail("the server said to slow down")
+                Err(e) =>
+                    match e
+                        AcmeClientRateLimited(p, wait) =>
+                            test.assert_eq(wait, 7)
+                            test.assert(acmemsg.problem_is_rate_limit(p))
+                            test.assert(str.contains(e.message(), "retry after 7 seconds"))
+                        _                              => test.fail("the fault is the rate limit")
+
+    test.case("an order for an identifier the server rejects is the server's sentence")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [AcmeIdentifier { kind: AcmeIpIdentifier, value: "192.0.2.1" }])
+                Ok(_)  => test.fail("the server takes dns only")
+                Err(e) =>
+                    test.assert_eq_str(problem_kind_of(e), "urn:ietf:params:acme:error:rejectedIdentifier")
+                    test.assert_eq_str(e.message(), "only dns identifiers")
+
+@test
+fn test_a_failed_challenge_is_a_terminal_authorization_with_the_servers_sentence() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("fail.example.test")])
+                Err(e)      => test.fail("order refused: ${e.message()}")
+                Ok(ordered) =>
+                    match acmeclient.authorization(r.0, ordered.1, ordered.0.authorizations[0])
+                        Err(e)  => test.fail("authorization refused: ${e.message()}")
+                        Ok(got) =>
+                            match acmemsg.challenge_by_kind(got.0, AcmeHttp01)
+                                None    => test.fail("HTTP-01 is offered")
+                                Some(c) =>
+                                    test.case("nothing was published, so the server's check fails")
+                                    match acmeclient.challenge_ready(r.0, got.1, c.url)
+                                        Err(e)   => test.fail("the ready call itself works: ${e.message()}")
+                                        Ok(told) =>
+                                            test.assert(acmemsg.is_terminal_challenge(told.0.status))
+                                            match told.0.problem
+                                                None    => test.fail("an invalid challenge carries its error")
+                                                Some(p) => test.assert(str.contains(acmemsg.problem_text(p), "404"))
+
+                                            test.case("the authorization and the order are terminal too")
+                                            match acmeclient.poll_authorization(r.0, told.1, ordered.0.authorizations[0])
+                                                Err(e)   => test.fail("poll: ${e.message()}")
+                                                Ok(done) =>
+                                                    test.assert(acmemsg.is_terminal_authz(done.0.status))
+                                                    match acmeclient.poll_order(r.0, done.1, ordered.0.url)
+                                                        Err(e)   => test.fail("poll: ${e.message()}")
+                                                        Ok(last) =>
+                                                            test.assert(acmemsg.is_terminal_order(last.0.status))
+                                                            match last.0.problem
+                                                                None    => test.fail("an invalid order carries its error")
+                                                                Some(p) => test.assert_eq_str(acmemsg.problem_text(p),
+                                                                    "an authorization failed")
+
+                                                            test.case("finalising an order that is not ready is the server's refusal")
+                                                            match acmeclient.finalize(r.0,
+                                                                last.1,
+                                                                last.0.finalize,
+                                                                request_for(["fail.example.test"]))
+                                                                Ok(_)  => test.fail("the order is invalid")
+                                                                Err(e) => test.assert_eq_str(problem_kind_of(e),
+                                                                    "urn:ietf:params:acme:error:orderNotReady")
+
+@test
+fn test_a_request_whose_names_differ_from_the_order_is_refused_by_the_server() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            control(base, "/ctl/set", "{\"cached_authz\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("mismatch.example.test")])
+                Err(e)      => test.fail("order refused: ${e.message()}")
+                Ok(ordered) =>
+                    test.case("names_match says so before the finalise is sent")
+                    let wrong = request_for(["other.example.test"])
+                    match acmecsr.names_match(wrong, ordered.0.identifiers)
+                        Ok(same) => test.assert(not same)
+                        Err(_)   => test.fail("the request reads")
+
+                    test.case("and the server agrees")
+                    match acmeclient.finalize(r.0, ordered.1, ordered.0.finalize, wrong)
+                        Ok(_)  => test.fail("the names differ")
+                        Err(e) =>
+                            test.assert_eq_str(problem_kind_of(e), "urn:ietf:params:acme:error:badCSR")
+                            test.assert(str.contains(e.message(), "do not match"))
+
+@test
+fn test_accounts_found_created_and_refused() [io, net, time, async]
+    let base = double()
+    let signer = acmeclient.signer(Es256, other_jwk(), sign_other)
+    match acmeclient.session(base + "/directory", signer)
+        Err(e) => test.fail("session: ${e.message()}")
+        Ok(s)  =>
+            match acmeclient.fresh_nonce(s)
+                Err(e) => test.fail("nonce: ${e.message()}")
+                Ok(n)  =>
+                    test.case("a key with no account is not silently registered by find_account")
+                    match acmeclient.find_account(s, n)
+                        Ok(_)  => test.fail("this key has no account")
+                        Err(e) =>
+                            test.assert_eq_str(problem_kind_of(e), "urn:ietf:params:acme:error:accountDoesNotExist")
+
+                    test.case("registering without agreeing to the terms is the server's refusal")
+                    match acmeclient.fresh_nonce(s)
+                        Err(e) => test.fail("nonce: ${e.message()}")
+                        Ok(n2) =>
+                            match acmeclient.new_account(s, n2, [], false)
+                                Ok(_)  => test.fail("terms must be agreed")
+                                Err(e) => test.assert_eq_str(problem_kind_of(e),
+                                    "urn:ietf:params:acme:error:userActionRequired")
+
+                            test.case("registering with the terms agreed creates it, and find_account then returns it")
+                            match acmeclient.fresh_nonce(s)
+                                Err(e) => test.fail("nonce: ${e.message()}")
+                                Ok(n3) =>
+                                    match acmeclient.new_account(s, n3, ["mailto:other@example.com"], true)
+                                        Err(e)  => test.fail("registration: ${e.message()}")
+                                        Ok(reg) =>
+                                            test.assert(str.starts_with(reg.1.url, base + "/acct/"))
+                                            test.assert_eq_str(reg.0.account_url, reg.1.url)
+                                            match acmeclient.find_account(reg.0, reg.2)
+                                                Err(e)    => test.fail("find: ${e.message()}")
+                                                Ok(found) =>
+                                                    test.assert_eq_str(found.1.url, reg.1.url)
+                                                    test.assert_eq_str(found.1.contact[0], "mailto:other@example.com")
+
+@test
+fn test_an_authorization_can_be_deactivated_and_a_challenge_read() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("deactivate.example.test")])
+                Err(e)      => test.fail("order refused: ${e.message()}")
+                Ok(ordered) =>
+                    let authz_url = ordered.0.authorizations[0]
+                    match acmeclient.authorization(r.0, ordered.1, authz_url)
+                        Err(e)  => test.fail("authorization: ${e.message()}")
+                        Ok(got) =>
+                            test.case("a challenge is read with a POST-as-GET, and its Link up is the authorization")
+                            match acmemsg.challenge_by_kind(got.0, AcmeDns01)
+                                None    => test.fail("DNS-01 is offered")
+                                Some(c) =>
+                                    match acmeclient.poll_challenge(r.0, got.1, c.url)
+                                        Err(e)     => test.fail("poll: ${e.message()}")
+                                        Ok(polled) =>
+                                            test.assert_eq_str(polled.0.url, c.url)
+                                            match acmeclient.post_as_get(r.0, polled.1, c.url)
+                                                Err(e) => test.fail("read: ${e.message()}")
+                                                Ok(x)  => test.assert_eq_str(x.link_up, authz_url)
+
+                                            test.case("deactivating makes a later order prove control again")
+                                            match acmeclient.deactivate_authorization(r.0, polled.1, authz_url)
+                                                Err(e)   => test.fail("deactivate: ${e.message()}")
+                                                Ok(done) =>
+                                                    match done.0.status
+                                                        AcmeAuthzDeactivated => test.assert(true)
+                                                        _                    => test.fail("deactivated")
+
+// ── what is refused before anything is sent ──────────────────────────
+
+fn offline_session(directory: AcmeDirectory, account: Str) -> AcmeSession
+    AcmeSession { directory: directory, signer: acmeclient.signer(Es256, account_jwk(), sign_account),
+                  account_url: account, timeout_ms: 1000, user_agent: "t" }
+
+fn offline_directory() -> AcmeDirectory
+    AcmeDirectory { new_nonce: "https://ca.test/nonce", new_account: "https://ca.test/acct", new_order: "https://ca.test/order",
+                    revoke_cert: "https://ca.test/revoke", key_change: "", terms_of_service: "", website: "",
+                    caa_identities: [], external_account_required: false }
+
+@test
+fn test_requests_that_need_an_account_say_so_before_sending() [io, net, time, async]
+    let s = offline_session(offline_directory(), "")
+    let n = acmejws.nonce("n")
+    test.case("each of them, with no account URL on the session")
+    match acmeclient.new_order(s, n, [acmemsg.dns_identifier("a.test")])
+        Ok(_)  => test.fail("no account")
+        Err(e) => test.assert(str.contains(e.message(), "no account is registered"))
+    match acmeclient.authorization(s, n, "https://ca.test/authz/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.poll_order(s, n, "https://ca.test/order/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.poll_challenge(s, n, "https://ca.test/chall/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.challenge_ready(s, n, "https://ca.test/chall/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.finalize(s, n, "https://ca.test/order/1/finalize", bytes.zeros(8))
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.download_certificate(s, n, "https://ca.test/cert/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.revoke(s, n, bytes.zeros(8), 0)
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+    match acmeclient.deactivate_authorization(s, n, "https://ca.test/authz/1")
+        Ok(_)  => test.fail("no account")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_key_is_named_the_way_the_request_needs() [io, net, time, async]
+    let s = offline_session(offline_directory(), "https://ca.test/acct/1")
+    let n = acmejws.nonce("n")
+    test.case("a kid on newAccount is refused, naming the request")
+    match acmeclient.post(s, n, "https://ca.test/acct", AcmeJwsKid("https://ca.test/acct/1"), "{}")
+        Ok(_)  => test.fail("newAccount is signed with the key itself")
+        Err(e) =>
+            match e
+                AcmeClientBadSignature(f) =>
+                    test.assert(str.contains(f.message(), "needs a jwk"))
+                    test.assert(str.contains(e.message(), "could not be signed"))
+                _                         => test.fail("the fault is the key identification")
+
+    test.case("a jwk on an order is refused too")
+    match acmeclient.post(s, n, "https://ca.test/order", AcmeJwsJwk(account_jwk()), "{}")
+        Ok(_)  => test.fail("an order is signed with the account URL")
+        Err(e) =>
+            match e
+                AcmeClientBadSignature(f) => test.assert(str.contains(f.message(), "needs a kid"))
+                _                         => test.fail("the fault is the key identification")
+
+    test.case("a signer that declines is a signature fault, not a transport one")
+    let declining = AcmeSession { directory: offline_directory(),
+                                  signer: acmeclient.signer(Es256, account_jwk(), refuse),
+                                  account_url: "https://ca.test/acct/1", timeout_ms: 1000, user_agent: "t" }
+    match acmeclient.post_as_get(declining, n, "https://ca.test/order/1")
+        Ok(_)  => test.fail("no signature")
+        Err(e) =>
+            match e
+                AcmeClientBadSignature(f) => test.assert_eq_str(f.message(), "the signing function declined to sign")
+                _                         => test.fail("the fault is the signature")
+
+fn refuse(input: Bytes) -> ?Bytes
     None
 
 @test
-fn test_the_staging_directory_is_named_beside_the_production_one() [io]
-    // Named together on purpose: a first-time user who reaches for the
-    // production URL burns a weekly rate limit learning what this
-    // library does.
-    test.case("both are URLs")
+fn test_only_https_or_loopback_may_carry_an_exchange() [io, net, time, async]
+    test.case("a plain http directory on a real host never leaves the machine")
+    match acmeclient.session("http://ca.example.com/directory", acmeclient.signer(Es256, account_jwk(), sign_account))
+        Ok(_)  => test.fail("plain http")
+        Err(e) =>
+            match e
+                AcmeClientInsecureUrl(u) =>
+                    test.assert_eq_str(u, "http://ca.example.com/directory")
+                    test.assert(str.contains(e.message(), "only a loopback address"))
+                _                        => test.fail("the fault says the URL is insecure")
+
+    test.case("a nonce URL from a hostile directory is held to the same rule")
+    let hostile = AcmeDirectory { new_nonce: "http://evil.example.com/nonce", new_account: "https://ca.test/acct",
+                                  new_order: "https://ca.test/order", revoke_cert: "https://ca.test/revoke",
+                                  key_change: "", terms_of_service: "", website: "", caa_identities: [],
+                                  external_account_required: false }
+    match acmeclient.fresh_nonce(offline_session(hostile, ""))
+        Ok(_)  => test.fail("plain http")
+        Err(e) =>
+            match e
+                AcmeClientInsecureUrl(_) => test.assert(true)
+                _                        => test.fail("the fault says the URL is insecure")
+
+    test.case("a refused connection is a transport fault with the reason")
+    match acmeclient.session("http://127.0.0.1:1/directory", acmeclient.signer(Es256, account_jwk(), sign_account))
+        Ok(_)  => test.fail("nothing listens on port 1")
+        Err(e) =>
+            match e
+                AcmeClientTransportFailed(d) => test.assert(str.contains(e.message(), "did not reach the server"))
+                _                            => test.fail("the fault is the transport")
+
+@test
+fn test_a_server_that_misbehaves_is_named() [io, net, time, async]
+    let base = double()
+    let signer = acmeclient.signer(Es256, account_jwk(), sign_account)
+
+    test.case("a directory URL that does not answer a directory")
+    match acmeclient.session(base + "/nothing", signer)
+        Ok(_)  => test.fail("not a directory")
+        Err(e) =>
+            match e
+                AcmeClientUnexpectedStatus(u, status) =>
+                    test.assert_eq_str(u, base + "/nothing")
+                    test.assert_eq(status, 405)
+                _                                     => test.fail("the fault is the unexpected status")
+    match acmeclient.session(base + "/ctl/set", signer)
+        Ok(_)  => test.fail("not a directory")
+        Err(_) => test.assert(true)
+
+    test.case("a 200 whose body is not a directory")
+    match acmeclient.session(base + "/ctl/log", signer)
+        Ok(_)  => test.fail("a list is not a directory")
+        Err(e) =>
+            match e
+                AcmeClientBadMessage(f) => test.assert(str.contains(e.message(), "could not be read"))
+                _                       => test.fail("the fault is the message")
+
+    test.case("a reply with no Replay-Nonce leaves nothing to sign the next request with")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            control(base, "/ctl/set", "{\"omit_nonce\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("nonce-less.example.test")])
+                Ok(_)  => test.fail("no nonce came back")
+                Err(e) =>
+                    control(base, "/ctl/set", "{\"omit_nonce\": 0}")
+                    match e
+                        AcmeClientNoNonce(u) => test.assert(str.contains(e.message(), "no Replay-Nonce"))
+                        _                    => test.fail("the fault is the missing nonce")
+
+    test.case("a fresh_nonce whose reply has none")
+    match new_session(base)
+        Err(e) => test.fail("session: ${e.message()}")
+        Ok(s)  =>
+            control(base, "/ctl/set", "{\"omit_nonce\": 1}")
+            match acmeclient.fresh_nonce(s)
+                Ok(_)  => test.fail("no nonce")
+                Err(e) =>
+                    control(base, "/ctl/set", "{\"omit_nonce\": 0}")
+                    match e
+                        AcmeClientNoNonce(_) => test.assert(true)
+                        _                    => test.fail("the fault is the missing nonce")
+
+    test.case("a newAccount or newOrder reply with no Location header")
+    match new_session(base)
+        Err(e) => test.fail("session: ${e.message()}")
+        Ok(s)  =>
+            match acmeclient.fresh_nonce(s)
+                Err(e) => test.fail("nonce: ${e.message()}")
+                Ok(n)  =>
+                    control(base, "/ctl/set", "{\"omit_location\": 1}")
+                    match acmeclient.new_account(s, n, [], true)
+                        Ok(_)  => test.fail("no Location")
+                        Err(e) =>
+                            control(base, "/ctl/set", "{\"omit_location\": 0}")
+                            match e
+                                AcmeClientNoLocation(u) => test.assert_eq_str(u, base + "/acct")
+                                _                       => test.fail("the fault is the missing Location")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            control(base, "/ctl/set", "{\"omit_location\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("locationless.example.test")])
+                Ok(_)  => test.fail("no Location")
+                Err(e) =>
+                    control(base, "/ctl/set", "{\"omit_location\": 0}")
+                    match e
+                        AcmeClientNoLocation(_) => test.assert(true)
+                        _                       => test.fail("the fault is the missing Location")
+
+    test.case("a finalise reply with no Location falls back to the finalise URL as the order URL")
+    control(base, "/ctl/set", "{\"cached_authz\": 1, \"no_finalize_location\": 1}")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("nofinloc.example.test")])
+                Err(e)      => test.fail("order: ${e.message()}")
+                Ok(ordered) =>
+                    match acmeclient.finalize(r.0, ordered.1, ordered.0.finalize, request_for(["nofinloc.example.test"]))
+                        Err(e)  => test.fail("finalize: ${e.message()}")
+                        Ok(fin) =>
+                            control(base, "/ctl/set", "{\"no_finalize_location\": 0}")
+                            test.assert_eq_str(fin.0.url, ordered.0.finalize)
+
+@test
+fn test_a_non_json_error_is_an_unexpected_status() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            test.case("a 404 on an unknown authorization has a problem body")
+            match acmeclient.authorization(r.0, r.1, base + "/authz/999999")
+                Ok(_)  => test.fail("no such authorization")
+                Err(e) => test.assert_eq_str(problem_kind_of(e), "urn:ietf:params:acme:error:malformed")
+
+            test.case("a reply that is neither a 2xx nor a problem is only a status")
+            match acmeclient.post_as_get(r.0, r.1, base + "/ctl/nothing")
+                Ok(_)  => test.fail("not an ACME endpoint")
+                Err(e) =>
+                    match e
+                        AcmeClientUnexpectedStatus(_, status) => test.assert_eq(status, 404)
+                        AcmeClientProblem(_)                  => test.assert(true)
+                        _                                     => test.fail("a status or a problem")
+
+@test
+fn test_the_small_pieces() [io, net, time, async]
+    test.case("the Let's Encrypt directories are named side by side")
     test.assert(str.starts_with(acmeclient.letsencrypt_directory_url(), "https://"))
     test.assert(str.starts_with(acmeclient.letsencrypt_staging_directory_url(), "https://"))
-
-    test.case("and they are not the same one")
     test.assert(acmeclient.letsencrypt_directory_url() != acmeclient.letsencrypt_staging_directory_url())
 
-@test
-fn test_there_is_no_get_on_this_page() [io, net, time, async]
-    // RFC 8555 § 6.3 replaced GET with POST-as-GET: a signed POST with
-    // an empty payload.  A client that sent a GET to an order URL gets
-    // 405 from every production server, and the failure names the
-    // method rather than the design mistake.  So the read is
-    // `post_as_get` and there is no `get` at all.
-    let s = acmeclient.signer(Es256, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"A\",\"y\":\"B\"}",
-                              refuse_to_sign)
-    match acmeclient.session(acmeclient.letsencrypt_staging_directory_url(), s)
-        Err(_)   => test.assert(true)
-        Ok(sess) =>
-            test.case("a read is a signed POST with nothing in it")
-            match acmeclient.post_as_get(sess, acmejws.nonce("n"), "https://example.com/acme/order/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
+    test.case("a session can change its deadline and its user agent")
+    let s = offline_session(offline_directory(), "")
+    let t = acmeclient.with_user_agent(acmeclient.with_timeout(s, 5), "ua/1")
+    test.assert_eq(t.timeout_ms, 5)
+    test.assert_eq_str(t.user_agent, "ua/1")
+    test.assert_eq_str(t.directory.new_order, "https://ca.test/order")
+
+    test.case("the signer keeps what it was given")
+    let sg = acmeclient.signer(Es256, "{}", refuse)
+    test.assert_eq_str(sg.jwk_json, "{}")
+
+    test.case("an exchange with a status of 400 or more is a problem, and its document can be read")
+    let x = AcmeExchange { status: 403, body: "{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\":\"no\"}",
+                           location: "", retry_after: 0, link_up: "", next_nonce: acmejws.nonce("n"), links: [] }
+    test.assert(acmeclient.is_problem(x))
+    match acmeclient.problem_of(x)
+        Ok(p)  => test.assert_eq_str(acmemsg.problem_text(p), "no")
+        Err(_) => test.fail("a problem document")
+    let bad = AcmeExchange { status: 200, body: "nope", location: "", retry_after: 0, link_up: "",
+                             next_nonce: acmejws.nonce("n"), links: [] }
+    test.assert(not acmeclient.is_problem(bad))
+    match acmeclient.problem_of(bad)
+        Ok(_)  => test.fail("not JSON")
+        Err(e) => test.assert(str.contains(e.message(), "could not be read"))
+
+    test.case("alternate chains are the rel=alternate targets of every Link line, and nothing else")
+    let linked = AcmeExchange { status: 200, body: "", location: "", retry_after: 0, link_up: "",
+                                next_nonce: acmejws.nonce("n"),
+                                links: ["<https://ca.test/directory>;rel=\"index\"",
+                                        "<https://ca.test/cert/1/a>;rel=\"alternate\", <https://ca.test/cert/1/b>;rel=alternate",
+                                        "garbage", "https://no-brackets;rel=\"alternate\"", "<unterminated;rel=\"alternate\""] }
+    let alt = acmeclient.alternate_chains(linked)
+    test.assert_eq(list.len(alt), 2)
+    test.assert_eq_str(alt[1], "https://ca.test/cert/1/b")
+
+    test.case("the clock gives a civil date this century")
+    test.assert(acmeclient.now_civil().date.year > 2000)
+
+    test.case("every fault renders in one line")
+    let p = AcmeProblem { kind: "urn:x", title: "", detail: "d", status: 0, subproblems: [] }
+    test.assert(str.contains(AcmeClientUnexpectedStatus("u", 500).message(), "status 500"))
+    test.assert(str.contains(AcmeClientProblem(p).message(), "d"))
+    test.assert(str.contains(AcmeClientBadMessage(AcmeMsgNotJson).message(), "not a JSON object"))
+    test.assert(str.contains(AcmeClientTransportFailed("x").message(), "x"))
+    test.assert(str.contains(AcmeClientNoLocation("u").message(), "Location"))
+    test.assert(str.contains(AcmeClientNoAccount.message(), "new_account"))
 
 @test
-fn test_the_client_surface_is_complete() [io, net, time, async]
-    // Every `pub fn` of `acmeclient`, named once.  The session is never
-    // built — the first `todo()` ends the test — but the calls are
-    // type-checked, which is what an interface release is for.
-    let signer = acmeclient.signer(Es256, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"A\",\"y\":\"B\"}",
-                                   refuse_to_sign)
-    match acmeclient.session(acmeclient.letsencrypt_staging_directory_url(), signer)
-        Err(_) => test.assert(true)
-        Ok(s0) =>
-            let s = acmeclient.with_user_agent(acmeclient.with_timeout(s0, 30000), "acme-nv/0.0.1")
-            let n = acmejws.nonce("n")
+fn test_more_server_misbehaviour() [io, net, time, async]
+    let base = double()
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            test.case("a body that is not an ACME document in a 2xx reply is a message fault")
+            let _ = control(base, "/ctl/set", "{\"garbage\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("garbage.example.test")])
+                Ok(_)  => test.fail("the server answered a status the RFC does not define")
+                Err(e) =>
+                    match e
+                        AcmeClientBadMessage(f) => test.assert(str.contains(f.message(), "sleeping"))
+                        _                       => test.fail("the fault is the message")
 
-            test.case("a fresh nonce, and the two request shapes")
-            match acmeclient.fresh_nonce(s)
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.post(s, n, "https://example.com/acme/new-order",
-                                  AcmeJwsKid("https://example.com/acme/acct/1"), "{}")
-                Ok(x)  =>
-                    test.assert(not acmeclient.is_problem(x))
-                    match acmeclient.problem_of(x)
-                        Ok(_)  => test.assert(true)
-                        Err(_) => test.assert(true)
-                    test.assert_eq(list.len(acmeclient.alternate_chains(x)), 0)
-                Err(_) => test.assert(true)
+            test.case("an error reply that is not JSON is only a status")
+            match acmeclient.post_as_get(r.0, r.1, base + "/ctl/plain500")
+                Ok(_)  => test.fail("500")
+                Err(e) =>
+                    match e
+                        AcmeClientUnexpectedStatus(_, status) => test.assert_eq(status, 500)
+                        _                                     => test.fail("a status, no problem")
 
-            test.case("the account calls")
-            match acmeclient.new_account(s, n, ["mailto:ops@example.com"], true)
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.find_account(s, n)
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
+    test.case("a badNonce reply that carries no nonce cannot be retried")
+    match registered(base)
+        Err(e) => test.fail("registration refused: ${e.message()}")
+        Ok(r)  =>
+            let _ = control(base, "/ctl/set", "{\"bad_nonce\": 1, \"omit_nonce\": 1}")
+            match acmeclient.new_order(r.0, r.1, [acmemsg.dns_identifier("nonce-less-retry.example.test")])
+                Ok(_)  => test.fail("no nonce to retry with")
+                Err(e) =>
+                    let _ = control(base, "/ctl/set", "{\"omit_nonce\": 0}")
+                    match e
+                        AcmeClientNoNonce(_) => test.assert(true)
+                        _                    => test.fail("the fault is the missing nonce")
 
-            test.case("the order calls")
-            match acmeclient.new_order(s, n, [acmemsg.dns_identifier("example.com")])
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.authorization(s, n, "https://example.com/acme/authz/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.challenge_ready(s, n, "https://example.com/acme/chall/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
+    test.case("a nonce URL that answers something other than 200 or 204")
+    let odd = AcmeDirectory { new_nonce: base + "/directory", new_account: "", new_order: "", revoke_cert: "",
+                              key_change: "", terms_of_service: "", website: "", caa_identities: [],
+                              external_account_required: false }
+    match acmeclient.fresh_nonce(offline_session(odd, ""))
+        Ok(_)  => test.fail("a HEAD on the directory is not a nonce")
+        Err(e) =>
+            match e
+                AcmeClientUnexpectedStatus(_, status) => test.assert_eq(status, 405)
+                _                                     => test.fail("the fault is the status")
 
-            test.case("the three polls, each one request and no loop")
-            match acmeclient.poll_challenge(s, n, "https://example.com/acme/chall/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.poll_authorization(s, n, "https://example.com/acme/authz/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.poll_order(s, n, "https://example.com/acme/order/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-
-            test.case("finalise, download, revoke and deactivate")
-            match acmeclient.finalize(s, n, "https://example.com/acme/order/1/finalize", bytes.zeros(8))
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.download_certificate(s, n, "https://example.com/acme/cert/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.revoke(s, n, bytes.zeros(8), 0)
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-            match acmeclient.deactivate_authorization(s, n, "https://example.com/acme/authz/1")
-                Ok(_)  => test.assert(true)
-                Err(_) => test.assert(true)
-
-@test
-fn test_the_clock_read_is_one_function() [io, time]
-    // The `[time]` in every client row above is std.http's request
-    // deadline; this is the one clock read the package makes for its
-    // own sake, and `acmerenew` takes what it answers.
-    test.case("it answers a civil date and time")
-    let now = acmeclient.now_civil()
-    test.assert(now.date.year > 2000)
+    test.case("a payload that cannot be written is refused before it is sent")
+    let acct = offline_session(offline_directory(), "https://ca.test/acct/1")
+    match acmeclient.new_order(acct, acmejws.nonce("n"), [])
+        Ok(_)  => test.fail("an order needs a name")
+        Err(e) =>
+            match e
+                AcmeClientBadMessage(AcmeMsgNoIdentifiers) => test.assert(true)
+                _                                          => test.fail("the fault is the empty identifier list")

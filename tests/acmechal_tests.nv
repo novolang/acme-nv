@@ -1,0 +1,206 @@
+// acmechal_tests.nv — the four values a caller publishes.
+//
+// The token and the key are the ones RFC 8555 section 8.1 shows; the
+// expected strings were computed outside this package with Python's
+// hashlib.
+
+use std.test
+use std.list
+use acmechal
+use acmemsg
+
+fn token() -> Str
+    "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA"
+
+fn jwk() -> Str
+    "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+
+fn chal(kind: AcmeChallengeKind, url: Str) -> AcmeChallenge
+    AcmeChallenge { url: url,
+        kind: kind,
+        status: AcmeChallengePending,
+        token: token(),
+        validated: "",
+        problem: None }
+
+fn authz(wildcard: Bool, kinds: [AcmeChallengeKind]) -> AcmeAuthorization
+    var cs: [AcmeChallenge] = []
+    for k in kinds
+        list.push(cs, chal(k, acmemsg.challenge_kind_name(k)))
+    AcmeAuthorization { url: "a", identifier: acmemsg.dns_identifier("example.com"), status: AcmeAuthzPending,
+                        expires: "", wildcard: wildcard, challenges: cs }
+
+fn url_of(c: ?AcmeChallenge) -> Str
+    match c
+        Some(x) => x.url
+        None    => "none"
+
+@test
+fn test_the_http01_values() [io]
+    test.case("the path, the port and the content type are fixed")
+    test.assert_eq_str(acmechal.ACME_HTTP01_PREFIX, "/.well-known/acme-challenge/")
+    test.assert_eq(acmechal.ACME_HTTP01_PORT, 80)
+    test.assert_eq_str(acmechal.ACME_DNS01_LABEL, "_acme-challenge")
+    test.assert_eq_str(acmechal.http01_content_type(), "application/octet-stream")
+
+    test.case("the path is the prefix and the token")
+    match acmechal.http01_path(token())
+        Ok(p)  => test.assert_eq_str(p, "/.well-known/acme-challenge/evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA")
+        Err(_) => test.fail("a well-formed token has a path")
+
+    test.case("the body is the key authorization with no trailing newline")
+    match acmechal.http01_body(token(), jwk())
+        Ok(b)  => test.assert_eq_str(b,
+            "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA.oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U")
+        Err(_) => test.fail("a well-formed token has a body")
+
+    test.case("the URL is plain http")
+    match acmechal.http01_url("example.com", token())
+        Ok(u)  => test.assert_eq_str(u,
+            "http://example.com/.well-known/acme-challenge/evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA")
+        Err(_) => test.fail("HTTP-01 is fetched over plain HTTP")
+    match acmechal.http01_url("*.example.com", token())
+        Ok(_)  => test.fail("a wildcard cannot be answered over HTTP")
+        Err(e) => test.assert_eq_str(e.message(), "`*.example.com` is not a DNS name")
+    match acmechal.http01_url("bad..name", token())
+        Ok(_)  => test.fail("not a name")
+        Err(_) => test.assert(true)
+    match acmechal.http01_url("example.com", "../etc")
+        Ok(_)  => test.fail("a token that is a path")
+        Err(_) => test.assert(true)
+
+    test.case("a body from a JWK that is not canonical, and from a token that is not a token")
+    match acmechal.http01_body(token(), "{}")
+        Ok(_)  => test.fail("no key")
+        Err(e) =>
+            match e
+                AcmeChalKeyAuthorizationRefused(_) => test.assert(str.contains(e.message(), "could not be built"))
+                _                                  => test.fail("the fault says the key authorization was refused")
+    match acmechal.http01_body("short", jwk())
+        Ok(_)  => test.fail("too short")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_token_is_checked_before_it_becomes_a_path() [io]
+    test.case("a separator is not well formed, and the fault names its position")
+    test.assert(not acmechal.token_is_wellformed("../../etc/passwd"))
+    match acmechal.http01_path("../../etc/passwd")
+        Ok(_)  => test.fail("that token must never become a path")
+        Err(e) =>
+            match e
+                AcmeChalTokenNotWellformed(at) =>
+                    test.assert_eq(at, 0)
+                    test.assert(str.contains(e.message(), "position 0"))
+                _                              => test.fail("the fault names the character")
+    match acmechal.http01_path("abcdefghijklmnopqrstuv/")
+        Ok(_)  => test.fail("a slash at the end")
+        Err(e) =>
+            match e
+                AcmeChalTokenNotWellformed(at) => test.assert_eq(at, 22)
+                _                              => test.fail("the fault names the position")
+
+    test.case("short tokens carry less than 128 bits")
+    match acmechal.http01_path("abc")
+        Ok(_)  => test.fail("three characters is not 128 bits")
+        Err(e) =>
+            match e
+                AcmeChalTokenTooShort(length, least) =>
+                    test.assert_eq(length, 3)
+                    test.assert_eq(least, 22)
+                    test.assert(str.contains(e.message(), "at least 22"))
+                _                                    => test.fail("the fault carries both lengths")
+
+    test.case("the boundaries: 22 characters pass, 21 do not, 1024 pass, 1025 do not")
+    test.assert(acmechal.token_is_wellformed(str.repeat("a", 22)))
+    test.assert(not acmechal.token_is_wellformed(str.repeat("a", 21)))
+    test.assert(acmechal.token_is_wellformed(str.repeat("a", 1024)))
+    test.assert(not acmechal.token_is_wellformed(str.repeat("a", 1025)))
+    test.assert(acmechal.token_is_wellformed("abcDEF0123456789-_abcdef"))
+    test.assert(not acmechal.token_is_wellformed("abcDEF0123456789=abcdef"))
+    test.assert(not acmechal.token_is_wellformed("abcDEF0123456789+abcdef"))
+    test.assert(not acmechal.token_is_wellformed("abcDEF0123456789.abcdef"))
+
+@test
+fn test_the_dns01_values() [io]
+    test.case("a wildcard and its base name share one record name")
+    let star = acmemsg.dns_identifier("*.example.com")
+    let plain = acmemsg.dns_identifier("example.com")
+    let other = acmemsg.dns_identifier("other.example.com")
+    test.assert(acmechal.dns01_records_share_a_name(star, plain))
+    test.assert(not acmechal.dns01_records_share_a_name(plain, other))
+    match acmechal.dns01_record_name("*.example.com")
+        Ok(n)  => test.assert_eq_str(n, "_acme-challenge.example.com")
+        Err(_) => test.fail("a wildcard has a record name")
+    match acmechal.dns01_record_name("example.com")
+        Ok(n)  => test.assert_eq_str(n, "_acme-challenge.example.com")
+        Err(_) => test.fail("a plain name has a record name")
+    match acmechal.dns01_record_name("bad..name")
+        Ok(_)  => test.fail("not a name")
+        Err(e) => test.assert_eq_str(e.message(), "`bad..name` is not a DNS name")
+
+    test.case("an order for both lists that name once; for two bases, twice")
+    match acmechal.dns01_names_for([star, plain])
+        Ok(names) => test.assert_eq(list.len(names), 1)
+        Err(_)    => test.fail("two identifiers, one record name")
+    match acmechal.dns01_names_for([star, plain, other])
+        Ok(names) => test.assert_eq_str(list.join(names, ","), "_acme-challenge.example.com,_acme-challenge.other.example.com")
+        Err(_)    => test.fail("three identifiers, two record names")
+    match acmechal.dns01_names_for([acmemsg.dns_identifier("bad..name")])
+        Ok(_)  => test.fail("not a name")
+        Err(_) => test.assert(true)
+
+    test.case("the value is the SHA-256 of the key authorization, base64url")
+    match acmechal.dns01_record_value(token(), jwk())
+        Ok(v)  => test.assert_eq_str(v, "ZaJgFtIV4WA0t2MzN7kbSk0sfRd2GZjaxRqaSTAK6lI")
+        Err(_) => test.fail("a token and a JWK are a record value")
+    match acmechal.dns01_record_value(token(), "{}")
+        Ok(_)  => test.fail("no key")
+        Err(_) => test.assert(true)
+    match acmechal.dns01_record_value("../x", jwk())
+        Ok(_)  => test.fail("not a token")
+        Err(_) => test.assert(true)
+
+    test.case("the advice waits out the negative cache, within a floor and a ceiling")
+    test.assert_eq(acmechal.dns01_propagation_advice(300), 310)
+    test.assert_eq(acmechal.dns01_propagation_advice(0), 30)
+    test.assert_eq(acmechal.dns01_propagation_advice(-500), 30)
+    test.assert_eq(acmechal.dns01_propagation_advice(86400), 3600)
+
+@test
+fn test_only_dns01_can_answer_a_wildcard() [io]
+    let star = acmemsg.dns_identifier("*.example.com")
+    let plain = acmemsg.dns_identifier("example.com")
+    test.assert(acmechal.kind_can_answer(AcmeDns01, star))
+    test.assert(not acmechal.kind_can_answer(AcmeHttp01, star))
+    test.assert(acmechal.kind_can_answer(AcmeHttp01, plain))
+    test.assert(acmechal.kind_can_answer(AcmeDns01, plain))
+    test.assert(not acmechal.kind_can_answer(AcmeTlsAlpn01, plain))
+    test.assert(not acmechal.kind_can_answer(AcmeUnknownChallenge("x"), plain))
+    let ip = AcmeIdentifier { kind: AcmeIpIdentifier, value: "192.0.2.1" }
+    test.assert(not acmechal.kind_can_answer(AcmeDns01, ip))
+
+@test
+fn test_the_preferred_challenge() [io]
+    test.case("the kind asked for, when it can answer")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(false, [AcmeDns01, AcmeHttp01]), AcmeHttp01)),
+        "http-01")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(false, [AcmeHttp01, AcmeDns01]), AcmeDns01)),
+        "dns-01")
+
+    test.case("a wildcard authorization falls back to DNS-01 though HTTP-01 is offered and preferred")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(true, [AcmeHttp01, AcmeDns01]), AcmeHttp01)),
+        "dns-01")
+
+    test.case("the first challenge that can answer when the preferred kind is not offered")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(false, [AcmeTlsAlpn01, AcmeDns01]), AcmeHttp01)),
+        "dns-01")
+
+    test.case("none, when nothing can answer")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(true, [AcmeHttp01, AcmeTlsAlpn01]), AcmeHttp01)),
+        "none")
+    test.assert_eq_str(url_of(acmechal.preferred_challenge(authz(false, []), AcmeHttp01)), "none")
+
+@test
+fn test_fault_messages() [io]
+    test.assert(str.contains(AcmeChalKindUnsupported(AcmeTlsAlpn01).message(), "tls-alpn-01"))
+    test.assert(str.contains(AcmeChalNotADnsName("x y").message(), "x y"))
