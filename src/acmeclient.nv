@@ -1,7 +1,5 @@
 // acmeclient.nv — the half that talks to the certificate authority.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW, and it is
 // `[io, net, time, async]` — which is `std.http`'s `HttpClient.send`
 // row and not a choice made here.  `[async]` because the transport
@@ -43,12 +41,19 @@
 // timeout policy for a process it knows nothing about, and would hide
 // the one thing an operator watching an issuance wants to see.
 
+use std.bytes
+use std.list
+use std.time
+use acmecsr
+use acmejws
 use acmemsg
+use civil
+use jwtalg
 
 // The public directory URL of the free certificate authority most
 // callers mean.
 pub fn letsencrypt_directory_url() -> Str []
-    todo("acme-nv.acmeclient.letsencrypt_directory_url")
+    "https://acme-v02.api.letsencrypt.org/directory"
 
 // The staging directory: real protocol, untrusted certificates, and
 // rate limits wide enough to develop against.
@@ -56,7 +61,7 @@ pub fn letsencrypt_directory_url() -> Str []
 // Named beside the production one on purpose.  Every rate limit a
 // first-time user runs into is one they would not have hit here.
 pub fn letsencrypt_staging_directory_url() -> Str []
-    todo("acme-nv.acmeclient.letsencrypt_staging_directory_url")
+    "https://acme-staging-v02.api.letsencrypt.org/directory"
 
 // How a client signs, and who it says it is.
 //
@@ -100,6 +105,9 @@ pub struct AcmeExchange
     // download offers alternate chains.
     link_up: Str
     next_nonce: AcmeNonce
+    // Every `Link` header line, as the server wrote it.  `link_up` and
+    // `alternate_chains` read from these.
+    links: [Str]
 
 // What can go wrong talking to a certificate authority.
 pub enum AcmeClientFault
@@ -115,6 +123,9 @@ pub enum AcmeClientFault
     AcmeClientNoLocation(url: Str)
     // The server answered a problem document.
     AcmeClientProblem(problem: AcmeProblem)
+    // The server said to slow down: the problem, and the seconds its
+    // `Retry-After` header asked for, or 0 when it gave none.
+    AcmeClientRateLimited(problem: AcmeProblem, retry_after: Int)
     // A status this package does not expect for the request it made.
     AcmeClientUnexpectedStatus(url: Str, status: Int)
     // A second `badNonce` for the same request.  Once is the protocol;
@@ -127,44 +138,66 @@ pub enum AcmeClientFault
     // A request made before the account was registered, which has no
     // `kid` to sign with.
     AcmeClientNoAccount
+    // A URL that is not https.  An ACME exchange carries an account
+    // identity and a certificate order, so only a loopback address,
+    // which a test server uses, may be plain http.
+    AcmeClientInsecureUrl(url: Str)
 
 // A signer from an algorithm, a canonical JWK and a signing function.
 pub fn signer(alg: JwtAlg, jwk_json: Str, sign: fn(Bytes) -> ?Bytes) -> AcmeSigner []
-    todo("acme-nv.acmeclient.signer")
+    AcmeSigner { alg: alg, jwk_json: jwk_json, sign: sign }
 
 // Fetch the directory and open a session.
 pub fn session(directory_url: Str,
                s: AcmeSigner) -> Result<AcmeSession, AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.session")
+    let probe = AcmeSession { directory: empty_directory(), signer: s, account_url: "",
+                              timeout_ms: 30000, user_agent: DEFAULT_USER_AGENT }
+    let reply = send(probe, "GET", directory_url, "", "", "")!
+    if reply.status != 200
+        return Err(AcmeClientUnexpectedStatus(directory_url, reply.status))
+    match acmemsg.parse_directory(bytes.to_str(reply.body), acmemsg.default_limits())
+        Err(f)  => Err(AcmeClientBadMessage(f))
+        Ok(dir) => Ok(AcmeSession { directory: dir, signer: s, account_url: "",
+                                    timeout_ms: probe.timeout_ms, user_agent: probe.user_agent })
 
 // A session with a different request deadline.
 pub fn with_timeout(s: AcmeSession, ms: Int) -> AcmeSession []
-    todo("acme-nv.acmeclient.with_timeout")
+    AcmeSession { directory: s.directory, signer: s.signer, account_url: s.account_url,
+                  timeout_ms: ms, user_agent: s.user_agent }
 
 // A session that identifies itself, which a certificate authority will
 // ask for when something goes wrong at scale.
 pub fn with_user_agent(s: AcmeSession, ua: Str) -> AcmeSession []
-    todo("acme-nv.acmeclient.with_user_agent")
+    AcmeSession { directory: s.directory, signer: s.signer, account_url: s.account_url,
+                  timeout_ms: s.timeout_ms, user_agent: ua }
 
 // Fetch a fresh nonce.
 //
 // A HEAD to the newNonce URL, which is the one request in the protocol
 // that is not a signed POST.
 pub fn fresh_nonce(s: AcmeSession) -> Result<AcmeNonce, AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.fresh_nonce")
+    let target = s.directory.new_nonce
+    let reply = send(s, "HEAD", target, "", "", "")!
+    let nonce = header_value(reply, "Replay-Nonce")
+    if reply.status != 200 and reply.status != 204
+        Err(AcmeClientUnexpectedStatus(target, reply.status))
+    else if nonce == ""
+        Err(AcmeClientNoNonce(target))
+    else
+        Ok(acmejws.nonce(nonce))
 
 // One signed POST, retrying once on `badNonce`.
 //
 // The nonce goes in and the next one comes out inside the exchange.
 pub fn post(s: AcmeSession, n: AcmeNonce, url: Str, key: AcmeJwsKeyId,
             payload_json: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.post")
+    post_with(s, n, url, key, payload_json, "")
 
 // One POST-as-GET: a signed POST with an empty payload, which is how
 // every read in this protocol is done.
 pub fn post_as_get(s: AcmeSession, n: AcmeNonce,
                    url: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.post_as_get")
+    post_with(s, n, url, AcmeJwsKid(s.account_url), acmejws.post_as_get_payload(), "")
 
 // Register an account, or find the existing one for this key.
 //
@@ -173,7 +206,9 @@ pub fn post_as_get(s: AcmeSession, n: AcmeNonce,
 // `Location` header.
 pub fn new_account(s: AcmeSession, n: AcmeNonce, contact: [Str],
                    terms_agreed: Bool) -> Result<(AcmeSession, AcmeAccount, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.new_account")
+    let payload = payload_or(acmemsg.write_new_account(contact, terms_agreed, false))!
+    let x = post(s, n, s.directory.new_account, AcmeJwsJwk(s.signer.jwk_json), payload)!
+    account_from(s, x)
 
 // Find the account for this key WITHOUT creating one.
 //
@@ -183,17 +218,28 @@ pub fn new_account(s: AcmeSession, n: AcmeNonce, contact: [Str],
 // account with no orders in it.
 pub fn find_account(s: AcmeSession,
                     n: AcmeNonce) -> Result<(AcmeSession, AcmeAccount, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.find_account")
+    let payload = payload_or(acmemsg.write_new_account([], false, true))!
+    let x = post(s, n, s.directory.new_account, AcmeJwsJwk(s.signer.jwk_json), payload)!
+    account_from(s, x)
 
 // Create an order for a set of names.
 pub fn new_order(s: AcmeSession, n: AcmeNonce,
                  identifiers: [AcmeIdentifier]) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.new_order")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let payload = payload_or(acmemsg.write_new_order(identifiers, "", ""))!
+    let x = post(s, n, s.directory.new_order, AcmeJwsKid(s.account_url), payload)!
+    if x.location == ""
+        return Err(AcmeClientNoLocation(s.directory.new_order))
+    let order = message_or(acmemsg.parse_order(x.body, x.location, acmemsg.default_limits()))!
+    Ok((order, x.next_nonce))
 
 // Read an authorization.
 pub fn authorization(s: AcmeSession, n: AcmeNonce,
                      url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.authorization")
+    let x = read_object(s, n, url)!
+    let authz = message_or(acmemsg.parse_authorization(x.body, url, acmemsg.default_limits()))!
+    Ok((authz, x.next_nonce))
 
 // Tell the server a challenge is ready to be checked.
 //
@@ -203,22 +249,30 @@ pub fn authorization(s: AcmeSession, n: AcmeNonce,
 // immediately.
 pub fn challenge_ready(s: AcmeSession, n: AcmeNonce,
                        challenge_url: Str) -> Result<(AcmeChallenge, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.challenge_ready")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let x = post(s, n, challenge_url, AcmeJwsKid(s.account_url), acmemsg.write_challenge_ready())!
+    let chal = message_or(acmemsg.parse_challenge(x.body, acmemsg.default_limits()))!
+    Ok((chal, x.next_nonce))
 
 // Read a challenge once.  The loop is the caller's.
 pub fn poll_challenge(s: AcmeSession, n: AcmeNonce,
                       challenge_url: Str) -> Result<(AcmeChallenge, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.poll_challenge")
+    let x = read_object(s, n, challenge_url)!
+    let chal = message_or(acmemsg.parse_challenge(x.body, acmemsg.default_limits()))!
+    Ok((chal, x.next_nonce))
 
 // Read an authorization once.  The loop is the caller's.
 pub fn poll_authorization(s: AcmeSession, n: AcmeNonce,
                           url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.poll_authorization")
+    authorization(s, n, url)
 
 // Read an order once.  The loop is the caller's.
 pub fn poll_order(s: AcmeSession, n: AcmeNonce,
                   url: Str) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.poll_order")
+    let x = read_object(s, n, url)!
+    let order = message_or(acmemsg.parse_order(x.body, url, acmemsg.default_limits()))!
+    Ok((order, x.next_nonce))
 
 // Finalise an order with a certification request.
 //
@@ -227,7 +281,16 @@ pub fn poll_order(s: AcmeSession, n: AcmeNonce,
 // whole issuance starts again, challenges included.
 pub fn finalize(s: AcmeSession, n: AcmeNonce, finalize_url: Str,
                 csr_der: Bytes) -> Result<(AcmeOrder, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.finalize")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let payload = payload_or(acmemsg.write_finalize(acmecsr.csr_text(csr_der)))!
+    let x = post(s, n, finalize_url, AcmeJwsKid(s.account_url), payload)!
+    let order_url = if x.location == ""
+        finalize_url
+    else
+        x.location
+    let order = message_or(acmemsg.parse_order(x.body, order_url, acmemsg.default_limits()))!
+    Ok((order, x.next_nonce))
 
 // Download the issued certificate chain as PEM.
 //
@@ -236,16 +299,24 @@ pub fn finalize(s: AcmeSession, n: AcmeNonce, finalize_url: Str,
 // differently — and `download_alternate` is how a caller takes one.
 pub fn download_certificate(s: AcmeSession, n: AcmeNonce,
                             certificate_url: Str) -> Result<(Str, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.download_certificate")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let x = post_with(s, n, certificate_url, AcmeJwsKid(s.account_url),
+                      acmejws.post_as_get_payload(), "application/pem-certificate-chain")!
+    Ok((x.body, x.next_nonce))
 
 // The alternate chain URLs a certificate download offered.
 pub fn alternate_chains(x: AcmeExchange) -> [Str] []
-    todo("acme-nv.acmeclient.alternate_chains")
+    link_targets(x.links, "alternate")
 
 // Revoke a certificate, signed with the account key.
 pub fn revoke(s: AcmeSession, n: AcmeNonce, certificate_der: Bytes,
               reason: Int) -> Result<AcmeNonce, AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.revoke")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let payload = payload_or(acmemsg.write_revoke(acmecsr.csr_text(certificate_der), reason))!
+    let x = post(s, n, s.directory.revoke_cert, AcmeJwsKid(s.account_url), payload)!
+    Ok(x.next_nonce)
 
 // Deactivate an authorization, so a later order for the name has to
 // prove control again.
@@ -255,7 +326,11 @@ pub fn revoke(s: AcmeSession, n: AcmeNonce, certificate_der: Bytes,
 // account can order a certificate for a name it no longer controls.
 pub fn deactivate_authorization(s: AcmeSession, n: AcmeNonce,
                                 url: Str) -> Result<(AcmeAuthorization, AcmeNonce), AcmeClientFault> [io, net, time, async]
-    todo("acme-nv.acmeclient.deactivate_authorization")
+    if s.account_url == ""
+        return Err(AcmeClientNoAccount)
+    let x = post(s, n, url, AcmeJwsKid(s.account_url), acmemsg.write_deactivate())!
+    let authz = message_or(acmemsg.parse_authorization(x.body, url, acmemsg.default_limits()))!
+    Ok((authz, x.next_nonce))
 
 // The wall clock, UTC, for a caller planning a renewal.
 //
@@ -263,16 +338,20 @@ pub fn deactivate_authorization(s: AcmeSession, n: AcmeNonce,
 // — the `[time]` in every row above is `std.http`'s deadline rather
 // than this.
 pub fn now_civil() -> CivilDateTime [time]
-    todo("acme-nv.acmeclient.now_civil")
+    let secs = time.now() as Int
+    let day = secs / 86400
+    let rest = secs % 86400
+    civil.datetime(civil.date_from_epoch_day(day),
+                   CivilTime { hour: rest / 3600, minute: rest / 60 % 60, second: rest % 60, nano: 0 })
 
 // Whether an exchange carried a problem document rather than an
 // object.
 pub fn is_problem(x: AcmeExchange) -> Bool []
-    todo("acme-nv.acmeclient.is_problem")
+    x.status >= 400
 
 // The problem an exchange carried.
 pub fn problem_of(x: AcmeExchange) -> Result<AcmeProblem, AcmeClientFault> []
-    todo("acme-nv.acmeclient.problem_of")
+    message_or(acmemsg.parse_problem(x.body, acmemsg.default_limits()))
 
 // What went wrong talking to the certificate authority, in one line.
 //
@@ -288,4 +367,180 @@ pub fn problem_of(x: AcmeExchange) -> Result<AcmeProblem, AcmeClientFault> []
 // ```
 impl Error for AcmeClientFault
     fn message(self) -> Str
-        todo("acme-nv.acmeclient.AcmeClientFault.message")
+        match self
+            AcmeClientTransportFailed(d)     => "the request did not reach the server: ${d}"
+            AcmeClientNoNonce(u)             => "the reply from ${u} carried no Replay-Nonce header"
+            AcmeClientNoLocation(u)          => "the reply from ${u} carried no Location header"
+            AcmeClientProblem(p)             => acmemsg.problem_text(p)
+            AcmeClientRateLimited(p, wait)   => "${acmemsg.problem_text(p)} (retry after ${wait} seconds)"
+            AcmeClientUnexpectedStatus(u, s) => "${u} answered status ${s}, which is not the answer to this request"
+            AcmeClientNonceRetryExhausted(u) => "the server refused two nonces in a row for ${u}"
+            AcmeClientBadMessage(f)          => "the server's message could not be read: ${f.message()}"
+            AcmeClientBadSignature(f)        => "the request could not be signed: ${f.message()}"
+            AcmeClientNoAccount              => "no account is registered on this session; call new_account or find_account first"
+            AcmeClientInsecureUrl(u)         => "${u} is not an https URL; only a loopback address may be plain http"
+
+// The user agent a session sends until `with_user_agent` replaces it.
+const DEFAULT_USER_AGENT = "acme-nv/0.1.0"
+
+// A directory with nothing in it, for the session that fetches the
+// real one.
+fn empty_directory() -> AcmeDirectory []
+    AcmeDirectory { new_nonce: "", new_account: "", new_order: "", revoke_cert: "", key_change: "",
+                    terms_of_service: "", website: "", caa_identities: [], external_account_required: false }
+
+// Whether a URL may carry an ACME exchange: https, or plain http to a
+// loopback address.
+fn url_allowed(url: Str) -> Bool []
+    str.starts_with(url, "https://") or str.starts_with(url, "http://127.0.0.1")
+        or str.starts_with(url, "http://localhost") or str.starts_with(url, "http://[::1]")
+
+// One HTTP exchange.  The `Content-Type` and the `Accept` are left
+// off when they are empty.
+fn send(s: AcmeSession, method: Str, url: Str, content_type: Str, accept: Str,
+        body: Str) -> Result<HttpReply, AcmeClientFault> [io, net, time, async]
+    if not url_allowed(url)
+        return Err(AcmeClientInsecureUrl(url))
+    var c = HttpClient.new(url).with_timeout(s.timeout_ms).with_redirects(0)
+    c = c.with_header("User-Agent", s.user_agent)
+    if content_type != ""
+        c = c.with_header("Content-Type", content_type)
+    if accept != ""
+        c = c.with_header("Accept", accept)
+    match c.send(method, url, bytes.from_str(body))
+        Err(e)    => Err(AcmeClientTransportFailed(http.client.error_text(e)))
+        Ok(reply) => Ok(reply)
+
+// The first header of that name, or `""`.
+fn header_value(r: HttpReply, name: Str) -> Str []
+    http.client.header(r, name) ?? ""
+
+// One signed POST, without the retry.  The Bool says the server
+// answered `badNonce`, and the exchange then carries the nonce to
+// retry with.
+fn post_once(s: AcmeSession, n: AcmeNonce, url: Str, key: AcmeJwsKeyId, payload_json: Str,
+             accept: Str) -> Result<(Bool, AcmeExchange), AcmeClientFault> [io, net, time, async]
+    let sign = s.signer.sign
+    let body = match acmejws.signed_request(sign, s.signer.alg, n, url, key, payload_json)
+        Err(e) =>
+            return Err(AcmeClientBadSignature(e))
+        Ok(b)  => b
+    let reply = send(s, "POST", url, "application/jose+json", accept, body)!
+    read_reply(url, reply)
+
+// A reply read as an exchange.  A 2xx is one; `badNonce` is one that
+// asks for a retry; any other problem is the fault.
+fn read_reply(url: Str, r: HttpReply) -> Result<(Bool, AcmeExchange), AcmeClientFault> []
+    let nonce = header_value(r, "Replay-Nonce")
+    let text = bytes.to_str(r.body)
+    let links = link_lines(r)
+    let x = AcmeExchange { status: r.status, body: text, location: header_value(r, "Location"),
+                           retry_after: str.to_int(header_value(r, "Retry-After")) ?? 0,
+                           link_up: first_target(links, "up"),
+                           next_nonce: acmejws.nonce(nonce), links: links }
+    if r.status >= 200 and r.status < 300
+        if nonce == ""
+            Err(AcmeClientNoNonce(url))
+        else
+            Ok((false, x))
+    else
+        match acmemsg.parse_problem(text, acmemsg.default_limits())
+            Err(_) => Err(AcmeClientUnexpectedStatus(url, r.status))
+            Ok(p)  =>
+                if p.kind == ""
+                    Err(AcmeClientUnexpectedStatus(url, r.status))
+                else if acmemsg.problem_is_bad_nonce(p)
+                    if nonce == ""
+                        Err(AcmeClientNoNonce(url))
+                    else
+                        Ok((true, x))
+                else if acmemsg.problem_is_rate_limit(p)
+                    Err(AcmeClientRateLimited(p, x.retry_after))
+                else
+                    Err(AcmeClientProblem(p))
+
+// The signed POST with a retry on `badNonce`, taking an `Accept`.
+fn post_with(s: AcmeSession, n: AcmeNonce, url: Str, key: AcmeJwsKeyId, payload_json: Str,
+             accept: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
+    check_key(s, url, key)!
+    let first = post_once(s, n, url, key, payload_json, accept)!
+    if not first.0
+        return Ok(first.1)
+    let second = post_once(s, first.1.next_nonce, url, key, payload_json, accept)!
+    if second.0
+        Err(AcmeClientNonceRetryExhausted(url))
+    else
+        Ok(second.1)
+
+// RFC 8555 section 6.2: newAccount is signed with the key itself and
+// every account request with the account URL; only a revocation may
+// be signed with the certificate's own key.
+fn check_key(s: AcmeSession, url: Str, key: AcmeJwsKeyId) -> Result<Bool, AcmeClientFault> []
+    match key
+        AcmeJwsJwk(_) =>
+            if url == s.directory.new_account or url == s.directory.revoke_cert
+                Ok(true)
+            else
+                Err(AcmeClientBadSignature(AcmeJwsWrongKeyId(url, "a kid: the account URL")))
+        AcmeJwsKid(_) =>
+            if url == s.directory.new_account
+                Err(AcmeClientBadSignature(AcmeJwsWrongKeyId(url, "a jwk: the account key itself")))
+            else
+                Ok(true)
+
+// A read: a POST-as-GET.
+fn read_object(s: AcmeSession, n: AcmeNonce,
+               url: Str) -> Result<AcmeExchange, AcmeClientFault> [io, net, time, async]
+    if s.account_url == ""
+        Err(AcmeClientNoAccount)
+    else
+        post_as_get(s, n, url)
+
+// A newAccount reply as the session, the account and the next nonce.
+fn account_from(s: AcmeSession,
+                x: AcmeExchange) -> Result<(AcmeSession, AcmeAccount, AcmeNonce), AcmeClientFault> []
+    if x.location == ""
+        return Err(AcmeClientNoLocation(s.directory.new_account))
+    let account = message_or(acmemsg.parse_account(x.body, x.location, acmemsg.default_limits()))!
+    let next = AcmeSession { directory: s.directory, signer: s.signer, account_url: x.location,
+                             timeout_ms: s.timeout_ms, user_agent: s.user_agent }
+    Ok((next, account, x.next_nonce))
+
+fn payload_or(r: Result<Str, AcmeMsgFault>) -> Result<Str, AcmeClientFault> []
+    match r
+        Ok(p)  => Ok(p)
+        Err(f) => Err(AcmeClientBadMessage(f))
+
+fn message_or<T>(r: Result<T, AcmeMsgFault>) -> Result<T, AcmeClientFault> []
+    match r
+        Ok(v)  => Ok(v)
+        Err(f) => Err(AcmeClientBadMessage(f))
+
+// Every `Link` header line of a reply.
+fn link_lines(r: HttpReply) -> [Str] []
+    var out: [Str] = []
+    for line in r.headers
+        let colon = str.index(line, ":") ?? -1
+        if colon > 0 and str.lower(str.trim(str.slice(line, 0, colon))) == "link"
+            list.push(out, str.trim(str.slice(line, colon + 1, str.len(line))))
+    out
+
+// The targets of the links with this `rel`.  A header line may hold
+// several links separated by commas.
+fn link_targets(links: [Str], rel: Str) -> [Str] []
+    var out: [Str] = []
+    for line in links
+        for part in str.split(line, ",")
+            if str.contains(part, "rel=\"" + rel + "\"") or str.contains(part, "rel=" + rel)
+                let open = str.index(part, "<") ?? -1
+                let close = str.index_from(part, ">", open + 1) ?? -1
+                if open >= 0 and close > open
+                    list.push(out, str.slice(part, open + 1, close))
+    out
+
+fn first_target(links: [Str], rel: Str) -> Str []
+    let all = link_targets(links, rel)
+    if list.len(all) == 0
+        ""
+    else
+        all[0]

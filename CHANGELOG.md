@@ -5,6 +5,54 @@ All notable changes to acme-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-11-01
+
+Every function has a body. The suites run against RFC 8555's own
+documents, RFC 7638 section 3.1's published thumbprint, RFC 7515
+appendix A.3's key and signature, certification requests made by
+Python's `cryptography` package, and a local ACME server that verifies
+what the client sends with its own code. Line coverage of `src/` is
+100%, with two sites excused by a `cov: skip` marker that gives its
+reason.
+
+### Changed
+
+- The dependencies are registry ranges at the newest published
+  versions: jwt-nv `^0.1`, p256-nv `^0.1`, asn1-nv `^0.1`, base64-nv
+  `^0.1` and calendar-nv `^0.2`. p256-nv 0.1.0 carries ECDSA, so the
+  signing function an ACME request needs exists; the package still takes
+  it as an argument, for a key that is held outside the process.
+- Breaking: `acmejws.thumbprint` takes its buffer as `var out`, because
+  it writes the digest into it.
+- Breaking: `acmejws.protected_header` no longer decides from the URL
+  whether a request wanted a `jwk` or a `kid`, since only the directory
+  knows which URL is newAccount. It refuses an empty `kid` and a `jwk`
+  that is not canonical, and `acmeclient.post` makes the directory-based
+  check: a `kid` on newAccount and a `jwk` anywhere but newAccount and
+  revokeCert are refused before anything is sent, as
+  `AcmeClientBadSignature(AcmeJwsWrongKeyId(...))`.
+- Breaking: `AcmeExchange` has a new field, `links`, holding every
+  `Link` header line, because `link_up` alone could not carry the
+  alternate chains `alternate_chains` reads.
+- Breaking: `AcmeJwsFault` has two new variants, `AcmeJwsBufferTooSmall`
+  and `AcmeJwsNotBase64Url`, and `AcmeClientFault` has two,
+  `AcmeClientRateLimited(problem, retry_after)`, which carries the wait
+  the server asked for, and `AcmeClientInsecureUrl(url)`.
+- `acmerenew` computes in whole seconds and returns the window as
+  `opens` no earlier than the certificate's start and `closes` no later
+  than its end.
+
+### Added
+
+- `acmeclient` refuses any URL that is not https, except a loopback
+  address, before a request is made. The directory's URLs are held to
+  the same rule.
+- `acmeclient.finalize` falls back to the finalise URL as the order's URL
+  when the reply has no `Location` header.
+- `tests/double/acme_double.py`, a local ACME server for the client
+  suite, and `tests/coverage.sh`, which merges the line coverage of the
+  suites over `src/`.
+
 ## 0.0.2 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.

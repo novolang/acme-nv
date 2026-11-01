@@ -1,3 +1,6 @@
+# Build outputs.
 _novo/
+
+# Generated from the sources by `novo doc`; a committed copy is a
+# second original.
 APIDOC.md
-/acme-nv

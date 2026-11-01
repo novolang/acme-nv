@@ -1,7 +1,6 @@
 // acmejws.nv — the request signature, and the value that makes a
 // replayed request impossible to write.
 //
-// Every body here is a `todo()`; the signatures are the design.
 // Every row is `[]`.
 //
 // A NONCE IS CONSUMED BY ONE REQUEST AND REPLACED BY ITS REPLY, AND
@@ -45,6 +44,13 @@
 // "begin validating" — so the two have separate named functions here
 // and in `acmemsg`, and neither has a default.
 
+use std.bytes
+use std.list
+use base64
+use hashing
+use jwtalg
+use p256
+
 // A server-issued nonce, good for exactly one request.
 //
 // A value rather than a string so that the single-use rule is visible
@@ -86,14 +92,18 @@ pub enum AcmeJwsFault
     AcmeJwsJwkNotCanonical(detail: Str)
     // A key this package cannot describe as a JWK.
     AcmeJwsUnsupportedKey
+    // An output buffer shorter than the digest it must hold.
+    AcmeJwsBufferTooSmall(got: Int, want: Int)
+    // Text that is not base64url without padding.
+    AcmeJwsNotBase64Url
 
 // A nonce from a `Replay-Nonce` header.
 pub fn nonce(value: Str) -> AcmeNonce []
-    todo("acme-nv.acmejws.nonce")
+    AcmeNonce { value: value }
 
 // The nonce's text, for a caller that has to log it.
 pub fn nonce_value(n: AcmeNonce) -> Str []
-    todo("acme-nv.acmejws.nonce_value")
+    n.value
 
 // The protected header, as canonical JSON.
 //
@@ -103,7 +113,20 @@ pub fn nonce_value(n: AcmeNonce) -> Str []
 // against a different endpoint on the same server.
 pub fn protected_header(alg: JwtAlg, n: AcmeNonce, url: Str,
                         key: AcmeJwsKeyId) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.protected_header")
+    if not algorithm_allowed(alg)
+        return Err(AcmeJwsAlgorithmNotAllowed(jwtalg.alg_name(alg)))
+    var kvs: [(Str, JsonValueH)] = [("alg", json.string(jwtalg.alg_name(alg))),
+                                    ("nonce", json.string(n.value)),
+                                    ("url", json.string(url))]
+    match key
+        AcmeJwsJwk(jwk_json) =>
+            check_jwk(jwk_json)!
+            list.push(kvs, ("jwk", json.parse(jwk_json) ?? json.null()))
+        AcmeJwsKid(account)  =>
+            if account == ""
+                return Err(AcmeJwsWrongKeyId(url, "a kid: the account URL"))
+            list.push(kvs, ("kid", json.string(account)))
+    Ok(json.stringify(json.object(kvs)))
 
 // The bytes a JWS signature is taken over:
 // `base64url(protected) || "." || base64url(payload)`.
@@ -111,7 +134,7 @@ pub fn protected_header(alg: JwtAlg, n: AcmeNonce, url: Str,
 // A separate function because the signing itself is the caller's — see
 // `signed_request` and the README's "What is missing" section.
 pub fn signing_input(protected_json: Str, payload_json: Str) -> Str []
-    todo("acme-nv.acmejws.signing_input")
+    base64url(bytes.from_str(protected_json)) + "." + base64url(bytes.from_str(payload_json))
 
 // The flattened JSON serialisation an ACME request body is:
 // `{"protected":"…","payload":"…","signature":"…"}`.
@@ -122,7 +145,17 @@ pub fn signing_input(protected_json: Str, payload_json: Str) -> Str []
 // calling `jwttoken.encode`.
 pub fn flattened(protected_json: Str, payload_json: Str,
                  signature: Bytes) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.flattened")
+    let want = signature_width(protected_json)!
+    let got = bytes.len(signature)
+    if want > 0 and got != want
+        Err(AcmeJwsSignatureWrongLength(got, want))
+    else if got == 0
+        Err(AcmeJwsSignatureRefused)
+    else
+        Ok(json.stringify(json.object([
+            ("protected", json.string(base64url(bytes.from_str(protected_json)))),
+            ("payload", json.string(base64url(bytes.from_str(payload_json)))),
+            ("signature", json.string(base64url(signature)))])))
 
 // One signed request body, from a signing function the caller supplies.
 //
@@ -138,7 +171,13 @@ pub fn flattened(protected_json: Str, payload_json: Str,
 // `ecdsa_signature_rs` is the conversion.
 pub fn signed_request(sign: fn(Bytes) -> ?Bytes, alg: JwtAlg, n: AcmeNonce, url: Str,
                       key: AcmeJwsKeyId, payload_json: Str) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.signed_request")
+    if not algorithm_allowed(alg)
+        return Err(AcmeJwsAlgorithmNotAllowed(jwtalg.alg_name(alg)))
+    let header = protected_header(alg, n, url, key)!
+    let input = signing_input(header, payload_json)
+    match sign(bytes.from_str(input))
+        None      => Err(AcmeJwsSignatureRefused)
+        Some(sig) => flattened(header, payload_json, sig)
 
 // Whether an algorithm may sign an ACME request.
 //
@@ -148,7 +187,10 @@ pub fn signed_request(sign: fn(Bytes) -> ?Bytes, alg: JwtAlg, n: AcmeNonce, url:
 // refusal of Hs256 and of anything a later jwt-nv adds without ACME
 // allowing it, made here rather than left to the server.
 pub fn algorithm_allowed(alg: JwtAlg) -> Bool []
-    todo("acme-nv.acmejws.algorithm_allowed")
+    match alg
+        Es256 => true
+        Rs256 => true
+        _     => false
 
 // The JWK for a P-256 public key, in RFC 7638 canonical form.
 //
@@ -157,16 +199,27 @@ pub fn algorithm_allowed(alg: JwtAlg) -> Bool []
 // there is one spelling of a key in this package and no way for the
 // header's copy and the thumbprint's copy to differ.
 pub fn jwk_of_ec(public: PublicKey) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.jwk_of_ec")
+    match p256.validate(public)
+        Some(_) => Err(AcmeJwsUnsupportedKey)
+        None    =>
+            let x = base64url(bytes.from_byte_list(public.x))
+            let y = base64url(bytes.from_byte_list(public.y))
+            Ok(json.stringify(json.object([("crv", json.string("P-256")), ("kty", json.string("EC")),
+                                           ("x", json.string(x)), ("y", json.string(y))])))
 
 // RFC 7638's thumbprint: SHA-256 over the canonical JWK.
-pub fn thumbprint(jwk_json: Str, out: Bytes) -> Result<Bytes, AcmeJwsFault> []
-    todo("acme-nv.acmejws.thumbprint")
+pub fn thumbprint(jwk_json: Str, var out: Bytes) -> Result<Bytes, AcmeJwsFault> []
+    check_jwk(jwk_json)!
+    if bytes.len(out) != 32
+        Err(AcmeJwsBufferTooSmall(bytes.len(out), 32))
+    else
+        Ok(hashing.sha256_finish(hashing.sha256_new(), bytes.from_str(jwk_json), var out))
 
 // The thumbprint as base64url without padding, which is the form a key
 // authorization carries.
 pub fn thumbprint_text(jwk_json: Str) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.thumbprint_text")
+    let digest = thumbprint(jwk_json, bytes.zeros(32))!
+    Ok(base64url(digest))
 
 // The key authorization: `token || "." || base64url(thumbprint)`.
 //
@@ -176,7 +229,8 @@ pub fn thumbprint_text(jwk_json: Str) -> Result<Str, AcmeJwsFault> []
 // because it is a property of the KEY, and the two challenges are two
 // ways of publishing it.
 pub fn key_authorization(token: Str, jwk_json: Str) -> Result<Str, AcmeJwsFault> []
-    todo("acme-nv.acmejws.key_authorization")
+    let print = thumbprint_text(jwk_json)!
+    Ok(token + "." + print)
 
 // The payload of a POST-as-GET: the empty string.
 //
@@ -185,7 +239,7 @@ pub fn key_authorization(token: Str, jwk_json: Str) -> Result<Str, AcmeJwsFault>
 // on a challenge URL it starts validation.  `acmemsg.write_challenge_ready`
 // is that other one.
 pub fn post_as_get_payload() -> Str []
-    todo("acme-nv.acmejws.post_as_get_payload")
+    ""
 
 // base64url without padding, which is every encoded field in a JWS.
 //
@@ -193,12 +247,17 @@ pub fn post_as_get_payload() -> Str []
 // standard base64 has its signature refused with a message that says
 // nothing about the encoding.
 pub fn base64url(data: Bytes) -> Str []
-    todo("acme-nv.acmejws.base64url")
+    base64.encode(data, B64UrlSafe, B64Unpadded)
 
 // The inverse, for reading a downloaded certificate or a nonce a
 // server encoded.
 pub fn base64url_decode(text: Str) -> Result<Bytes, AcmeJwsFault> []
-    todo("acme-nv.acmejws.base64url_decode")
+    if str.contains(text, "=")
+        Err(AcmeJwsNotBase64Url)
+    else
+        match base64.decode(text, B64UrlSafe)
+            Ok(b)  => Ok(b)
+            Err(_) => Err(AcmeJwsNotBase64Url)
 
 // What went wrong signing a request, in one line.
 //
@@ -210,4 +269,55 @@ pub fn base64url_decode(text: Str) -> Result<Bytes, AcmeJwsFault> []
 // ```
 impl Error for AcmeJwsFault
     fn message(self) -> Str
-        todo("acme-nv.acmejws.AcmeJwsFault.message")
+        match self
+            AcmeJwsWrongKeyId(r, w)           => "the request to ${r} needs ${w}"
+            AcmeJwsSignatureRefused           => "the signing function declined to sign"
+            AcmeJwsSignatureWrongLength(g, w) => "the signature is ${g} bytes; this algorithm's is ${w}, the fixed-width r then s, not DER"
+            AcmeJwsAlgorithmNotAllowed(n)     => "the algorithm ${n} may not sign an ACME request"
+            AcmeJwsJwkNotCanonical(d)         => "the JWK is not in RFC 7638 canonical form: ${d}"
+            AcmeJwsUnsupportedKey             => "the key cannot be written as a JWK"
+            AcmeJwsBufferTooSmall(g, w)       => "the output buffer is ${g} bytes; ${w} are needed"
+            AcmeJwsNotBase64Url               => "the text is not base64url without padding"
+
+// A JWK checked against RFC 7638: only the members its key type
+// needs, in lexicographic order, with no whitespace.  The answer is
+// the same text, so a caller can keep going with a value it knows is
+// canonical.
+fn check_jwk(jwk_json: Str) -> Result<Str, AcmeJwsFault> []
+    match json.parse(jwk_json)
+        None    => Err(AcmeJwsJwkNotCanonical("the text is not JSON"))
+        Some(v) =>
+            if json.type_of(v) != "object"
+                return Err(AcmeJwsJwkNotCanonical("the text is not a JSON object"))
+            var names: [Str] = []
+            match json.get_str(v, "kty") ?? ""
+                "EC"  =>
+                    names = ["crv", "kty", "x", "y"]
+                "RSA" =>
+                    names = ["e", "kty", "n"]
+                _     =>
+                    return Err(AcmeJwsUnsupportedKey)
+            var kvs: [(Str, JsonValueH)] = []
+            for name in names
+                match json.get_str(v, name)
+                    None       =>
+                        return Err(AcmeJwsJwkNotCanonical("the member `${name}` is missing or is not a string"))
+                    Some(text) =>
+                        list.push(kvs, (name, json.string(text)))
+            if list.len(json.keys(v)) != list.len(names)
+                return Err(AcmeJwsJwkNotCanonical("the key has a member its type does not need"))
+            if json.stringify(json.object(kvs)) != jwk_json
+                Err(AcmeJwsJwkNotCanonical("the members are out of order or the text has whitespace"))
+            else
+                Ok(jwk_json)
+
+// The width, in bytes, of the signature a protected header's algorithm
+// produces: 64 for ES256, and 0 for RS256, whose width is the key's.
+fn signature_width(protected_json: Str) -> Result<Int, AcmeJwsFault> []
+    let name = match json.parse(protected_json)
+        None    => ""
+        Some(v) => json.get_str(v, "alg") ?? ""
+    match name
+        "ES256" => Ok(64)
+        "RS256" => Ok(0)
+        _       => Err(AcmeJwsAlgorithmNotAllowed(name))

@@ -7,11 +7,6 @@ novo-lang: account creation, orders, the HTTP-01 and DNS-01 challenges,
 certificate request generation, finalisation, certificate download, revocation,
 and the arithmetic that says when to renew.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What ACME is
 
 A certificate authority will issue a certificate for a domain name only to
@@ -57,12 +52,19 @@ use acmeclient
 use acmejws
 use acmemsg
 
+// Publish the HTTP-01 answer.  Where it goes is a decision about a web
+// server this package has never heard of, so the caller supplies it.
+fn publish_http01(c: AcmeChallenge, jwk: Str, publish: fn(Str, Str) -> Bool) -> Bool
+    match acmechal.http01_path(c.token)
+        Err(_)   => false
+        Ok(path) =>
+            match acmechal.http01_body(c.token, jwk)
+                Err(_)   => false
+                Ok(body) => publish(path, body)
+
 // Order a certificate for one name, proving control with HTTP-01.
 //
-// `sign` is a named function the caller supplies — see "What is
-// missing": there is no ECDSA signer on the registry yet.  `publish` is
-// the caller's too: writing the challenge file is a decision about a
-// web server this package has never heard of.
+// `sign` is a named function the caller supplies; see "Signing".
 fn order(host: Str, jwk: Str, sign: fn(Bytes) -> ?Bytes,
          publish: fn(Str, Str) -> Bool) -> Result<Str, AcmeClientFault> [io, net, time, async]
     let s = acmeclient.session(acmeclient.letsencrypt_staging_directory_url(),
@@ -76,25 +78,29 @@ fn order(host: Str, jwk: Str, sign: fn(Bytes) -> ?Bytes,
     // One authorization, one challenge, published by the caller.
     let got = acmeclient.authorization(registered.0, ordered.1, ordered.0.authorizations[0])!
     match acmechal.preferred_challenge(got.0, AcmeHttp01)
-        None    => Err(AcmeClientNoAccount)
+        None    => Err(AcmeClientBadMessage(AcmeMsgFieldMissing("challenges")))
         Some(c) =>
-            let path = acmechal.http01_path(c.token)!
-            let body = acmechal.http01_body(c.token, jwk)!
-            let _ = publish(path, body)
-            let told = acmeclient.challenge_ready(registered.0, got.1, c.url)!
-            Ok(told.0.url)
+            if not publish_http01(c, jwk, publish)
+                Err(AcmeClientTransportFailed("the challenge could not be published"))
+            else
+                let told = acmeclient.challenge_ready(registered.0, got.1, c.url)!
+                Ok(told.0.url)
 ```
 
 Build and test with:
 
 ```
 novo pkg build               # type- and effect-check the package
-novo test --isolate tests/acmeflow_tests.nv
+novo test tests/acmemsg_tests.nv
+bash tests/coverage.sh       # every suite, and the line coverage of src/
 ```
 
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: acme-nv.<module>.<fn>`. The tests are the specification the
-implementation will have to satisfy.
+`tests/acmeclient_tests.nv` needs `python3` with the `cryptography`
+package. It starts a small ACME server on the loopback interface and
+talks to nothing else. The server verifies every signature, rebuilds
+every key authorization and parses every certification request with
+its own code, so a request this client gets wrong is refused by
+something other than this client.
 
 ## What the package contains
 
@@ -130,7 +136,7 @@ answers a boolean.
 1. **A nonce is used once.** It is a value threaded through the calls, not a
    field the session updates.
 
-   ```novo
+   ```novo ignore
    let ordered = acmeclient.new_order(session, nonce, identifiers)!
    // ordered.1 is the NEXT nonce; the one above it is spent.
    ```
@@ -185,29 +191,40 @@ answers a boolean.
    rather than retry. A `newAccount` or `newOrder` reply with no `Location`
    header is `AcmeClientNoLocation(url)`, since the object then has no URL.
 
-## What is missing, by name
+## Signing
 
-This package cannot complete an issuance today. Two things are absent.
+The account key signs with ECDSA over P-256, and
+[p256-nv](https://novo-lang.org/packages/p256-nv) supplies `ecdsa_sign`.
+jwt-nv publishes the key vocabulary, `JwtAlg`, `JwtSigningKey` and
+`ec_signing_key`, but no function that signs arbitrary bytes. An ACME
+request is the flattened JSON serialisation over a protected header with a
+nonce and a URL in it, which is not a claims set, so `jwttoken.encode` is
+the wrong shape.
 
-- **ECDSA signing over P-256.** [p256-nv](https://novo-lang.org/packages/p256-nv)
-  0.0.2 carries ECDH and nothing else: `ecdh`, `key_pair_from_random`,
-  `validate`, and no `sign`. Every ACME request is signed and so is every
-  certification request, so a client without it signs nothing. What closes it is
-  a `sign` function in p256-nv, or an ECDSA package beside it.
-- **A raw signer in jwt-nv.** jwt-nv 0.0.3 publishes `JwtAlg`, `JwtSigningKey`
-  and `ec_signing_key`, which is the key vocabulary, and
-  `jwttoken.encode(header, claims, key)`, which signs a JWT's compact
-  serialisation over a claims set. An ACME request is the *flattened JSON*
-  serialisation over a protected header containing a nonce and a URL, which is
-  not a claims set, so `encode` is the wrong shape and `signing_input` takes the
-  wrong arguments. One function would close it —
-  `jwtalg.sign_raw(key: JwtSigningKey, input: Bytes) -> Result<Bytes, JwtError>`
-  — and it would serve any other JWS profile too.
+So `acmejws.signed_request` and `acmeclient.signer` take the signing
+function as an argument: a named function from the bytes to sign to the
+64-byte `r || s`, or `None` when it declines. That also suits a caller
+whose account key lives in a hardware token or a cloud key service, who
+supplies a function and never holds the key. For an in-memory key the
+function is a few lines:
 
-Until then, `acmejws.signed_request` and `acmeclient.signer` take the signing
-function as an argument. That also suits a caller whose account key lives in a
-hardware token or a cloud key service: such a caller supplies a function and
-never holds the key.
+```novo ignore
+use std.bytes
+use hashing
+use p256
+
+fn sign_with_account(input: Bytes) -> ?Bytes
+    match p256.secret_key_from_bytes(account_secret)
+        Err(_) => None
+        Ok(sk) =>
+            match p256.ecdsa_sign(sk, bytes.to_byte_list(hashing.sha256(input)))
+                Err(_)  => None
+                Ok(sig) => Some(bytes.from_byte_list(sig))
+```
+
+The certification request is signed over the bytes `acmecsr.csr_info`
+returns, and its signature is the DER form, which `asn1pkix.ecdsa_signature_der`
+makes from `r` and `s`.
 
 ## What is not included
 
@@ -245,14 +262,11 @@ never holds the key.
 | Package | What it supplies |
 | --- | --- |
 | jwt-nv | `JwtAlg`, `JwtSigningKey` and `ec_signing_key`: the key vocabulary an ACME signature is made with. |
-| [p256-nv](https://novo-lang.org/packages/p256-nv) | The account key and the certificate key. |
+| [p256-nv](https://novo-lang.org/packages/p256-nv) | The account key and the certificate key, and the ECDSA signing that uses them. |
 | asn1-nv | `AsnName`, `AsnExtension`, the subjectAltName object identifier, `write_spki` and `ecdsa_signature_der`. `acmecsr` builds PKCS#10 out of these and encodes no DER of its own. |
 | [crypto-nv](https://novo-lang.org/packages/crypto-nv) | SHA-256, for the JWK thumbprint and for the DNS-01 record's value. |
 | base64-nv | base64url without padding, which is every encoded field in a JWS and the certification request in a finalise payload. ACME uses the URL alphabet with the padding stripped everywhere, and a client that sent standard base64 has its signature refused with no useful message. |
 | calendar-nv | Civil dates and time deltas, for renewal planning and for reading the RFC 3339 timestamps an order and an authorization carry. |
-
-tls-nv needs the verification half of the same ECDSA function this package needs
-the signing half of.
 
 ## The reference implementation
 
@@ -273,48 +287,12 @@ internally. Here the nonce is a value the caller threads, so the single-use rule
 is in the types rather than in a comment.
 
 It signs with `ring` behind a signer trait it owns. Here the signing function is
-an argument, because there is no signer on the registry to own.
+an argument, so a key held outside the process signs as easily as one in memory.
 
 And certbot's plugin architecture — what lets it publish an HTTP-01 challenge
 through nginx or a DNS-01 challenge through fifty providers — is not ported. The
 four strings this package produces, handed to a caller that knows its own
 infrastructure, do the same work.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `acmemsg` — `AcmeDirectory`, `AcmeAccountStatus`, `AcmeAccount`, `AcmeIdentifierKind`, `AcmeIdentifier`, `AcmeOrderStatus`, `AcmeOrder`, `AcmeAuthzStatus`, `AcmeAuthorization`, `AcmeChallengeKind`, `AcmeChallengeStatus`, `AcmeChallenge`, `AcmeProblem`, `AcmeMsgLimits`, `AcmeMsgFault` | types only |
-| `acmemsg.default_limits`, `.parse_directory`, `.parse_account`, `.parse_order`, `.parse_authorization`, `.parse_challenge`, `.parse_problem` | no |
-| `acmemsg.write_new_account`, `.write_new_order`, `.write_finalize`, `.write_challenge_ready`, `.write_revoke`, `.write_deactivate` | no |
-| `acmemsg.dns_identifier`, `.is_wildcard`, `.base_name`, `.identifier_for`, `.challenge_by_kind`, `.challenge_kind_of_name`, `.challenge_kind_name` | no |
-| `acmemsg.is_terminal_order`, `.is_terminal_authz`, `.is_terminal_challenge` | no |
-| `acmemsg.problem_is_bad_nonce`, `.problem_is_rate_limit`, `.problem_is_challenge_failure`, `.problem_kind`, `.problem_text`, the `message` implementation | no |
-| `acmejws` — `AcmeNonce`, `AcmeJwsKeyId`, `AcmeJwsFault` | types only |
-| `acmejws.nonce`, `.nonce_value`, `.protected_header`, `.signing_input`, `.flattened`, `.signed_request`, `.algorithm_allowed` | no |
-| `acmejws.jwk_of_ec`, `.thumbprint`, `.thumbprint_text`, `.key_authorization` | no |
-| `acmejws.post_as_get_payload`, `.base64url`, `.base64url_decode`, the `message` implementation | no |
-| `acmechal` — `AcmeChalFault` | types only |
-| `acmechal.ACME_DNS01_LABEL`, `.ACME_HTTP01_PREFIX`, `.ACME_HTTP01_PORT` | yes (they are constants) |
-| `acmechal.token_is_wellformed`, `.http01_path`, `.http01_body`, `.http01_url`, `.http01_content_type` | no |
-| `acmechal.dns01_record_name`, `.dns01_record_value`, `.dns01_records_share_a_name`, `.dns01_names_for` | no |
-| `acmechal.kind_can_answer`, `.preferred_challenge`, `.dns01_propagation_advice`, the `message` implementation | no |
-| `acmecsr` — `AcmeCsrFault`, `AcmeCsrScheme` | types only |
-| `acmecsr.ACME_CSR_SUBJECT_IS_EMPTY` | yes (it is a constant) |
-| `acmecsr.csr_info`, `.csr`, `.csr_text`, `.names_of`, `.names_match`, `.first_name_disagreement` | no |
-| `acmecsr.names_for_order`, `.name_is_wellformed`, `.scheme_oid_text`, `.signature_len_for`, the `message` implementation | no |
-| `acmerenew` — `AcmeRenewalPolicy`, `AcmeRenewalWindow`, `AcmeRenewFault` | types only |
-| `acmerenew.ACME_RENEW_AT_NUMERATOR`, `.ACME_RENEW_AT_DENOMINATOR` | yes (they are constants) |
-| `acmerenew.default_policy`, `.with_fraction`, `.with_least_days_left`, `.with_window_hours`, `.renewal_window` | no |
-| `acmerenew.should_renew`, `.days_left`, `.lifetime_days`, `.lifetime_used_percent` | no |
-| `acmerenew.parse_timestamp`, `.order_expires_at`, `.authorization_expires_at`, `.order_needs_no_challenge`, `.poll_backoff_seconds`, the `message` implementation | no |
-| `acmeclient` — `AcmeSigner`, `AcmeSession`, `AcmeExchange`, `AcmeClientFault` | types only |
-| `acmeclient.letsencrypt_directory_url`, `.letsencrypt_staging_directory_url`, `.signer`, `.session`, `.with_timeout`, `.with_user_agent` | no |
-| `acmeclient.fresh_nonce`, `.post`, `.post_as_get` | no |
-| `acmeclient.new_account`, `.find_account`, `.new_order`, `.authorization`, `.challenge_ready` | no |
-| `acmeclient.poll_challenge`, `.poll_authorization`, `.poll_order` | no |
-| `acmeclient.finalize`, `.download_certificate`, `.alternate_chains`, `.revoke`, `.deactivate_authorization` | no |
-| `acmeclient.now_civil`, `.is_problem`, `.problem_of`, the `message` implementation | no |
 
 ## Licence
 

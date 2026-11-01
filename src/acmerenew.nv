@@ -1,7 +1,6 @@
 // acmerenew.nv — when to renew, which is a fraction of a lifetime and
 // not a number of days.
 //
-// Every body here is a `todo()`; the signatures are the design.
 // Every row is `[]`, and "now" is an argument.
 //
 // RENEW AT A FRACTION OF THE LIFETIME, NOT AT A FIXED OFFSET FROM
@@ -34,6 +33,12 @@
 // them as text so that a timestamp this package cannot parse does not
 // stop an order being read, and this module is where they become
 // dates.  calendar-nv's `parse_rfc3339` does the work.
+
+use acmemsg
+use arith
+use civil
+use iso8601
+use span
 
 // The fraction of a lifetime after which renewal should begin, as a
 // numerator and a denominator.
@@ -82,25 +87,43 @@ pub enum AcmeRenewFault
 // The published policy: two thirds of the lifetime, a floor of seven
 // days, spread over a twenty-four hour window.
 pub fn default_policy() -> AcmeRenewalPolicy []
-    todo("acme-nv.acmerenew.default_policy")
+    AcmeRenewalPolicy { at_numerator: ACME_RENEW_AT_NUMERATOR, at_denominator: ACME_RENEW_AT_DENOMINATOR,
+                        least_days_left: 7, window_hours: 24 }
 
 // A policy with a different fraction.
 pub fn with_fraction(p: AcmeRenewalPolicy, numerator: Int,
                      denominator: Int) -> Result<AcmeRenewalPolicy, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.with_fraction")
+    if numerator <= 0 or denominator <= 0 or numerator >= denominator
+        Err(AcmeRenewBadFraction(numerator, denominator))
+    else
+        Ok(AcmeRenewalPolicy { at_numerator: numerator, at_denominator: denominator,
+                               least_days_left: p.least_days_left, window_hours: p.window_hours })
 
 // A policy with a different floor.
 pub fn with_least_days_left(p: AcmeRenewalPolicy, days: Int) -> AcmeRenewalPolicy []
-    todo("acme-nv.acmerenew.with_least_days_left")
+    AcmeRenewalPolicy { at_numerator: p.at_numerator, at_denominator: p.at_denominator,
+                        least_days_left: days, window_hours: p.window_hours }
 
 // A policy with a different spreading window.
 pub fn with_window_hours(p: AcmeRenewalPolicy, hours: Int) -> AcmeRenewalPolicy []
-    todo("acme-nv.acmerenew.with_window_hours")
+    AcmeRenewalPolicy { at_numerator: p.at_numerator, at_denominator: p.at_denominator,
+                        least_days_left: p.least_days_left, window_hours: hours }
 
 // The window a certificate with this lifetime should be renewed in.
 pub fn renewal_window(not_before: CivilDateTime, not_after: CivilDateTime,
                       p: AcmeRenewalPolicy) -> Result<AcmeRenewalWindow, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.renewal_window")
+    let life = lifetime_seconds(not_before, not_after)!
+    let by_fraction = shifted(not_before, life * p.at_numerator / p.at_denominator)!
+    let by_floor = shifted(not_after, 0 - p.least_days_left * 86400)!
+    var opens = by_fraction
+    if civil.compare_datetime(by_floor, opens) < 0
+        opens = by_floor
+    if civil.compare_datetime(opens, not_before) < 0
+        opens = not_before
+    var closes = shifted(opens, p.window_hours * 3600)!
+    if civil.compare_datetime(closes, not_after) > 0
+        closes = not_after
+    Ok(AcmeRenewalWindow { opens: opens, closes: closes })
 
 // Whether it is time.
 //
@@ -109,17 +132,20 @@ pub fn renewal_window(not_before: CivilDateTime, not_after: CivilDateTime,
 // the strongest possible yes.
 pub fn should_renew(not_before: CivilDateTime, not_after: CivilDateTime, now: CivilDateTime,
                     p: AcmeRenewalPolicy) -> Result<Bool, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.should_renew")
+    let w = renewal_window(not_before, not_after, p)!
+    Ok(civil.compare_datetime(now, w.opens) >= 0)
 
 // Days until expiry — NEGATIVE when it has already passed, rather than
 // clamped at zero, because how far past is the number a caller reports.
 pub fn days_left(not_after: CivilDateTime, now: CivilDateTime) -> Int []
-    todo("acme-nv.acmerenew.days_left")
+    let secs = epoch_seconds(not_after) - epoch_seconds(now)
+    floor_div(secs, 86400)
 
 // How long the certificate is good for altogether, in days.
 pub fn lifetime_days(not_before: CivilDateTime,
                      not_after: CivilDateTime) -> Result<Int, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.lifetime_days")
+    let life = lifetime_seconds(not_before, not_after)!
+    Ok(life / 86400)
 
 // How far into the lifetime `now` is, as a percentage.
 //
@@ -128,7 +154,14 @@ pub fn lifetime_days(not_before: CivilDateTime,
 // thundering herd this module exists to avoid.
 pub fn lifetime_used_percent(not_before: CivilDateTime, not_after: CivilDateTime,
                              now: CivilDateTime) -> Result<Int, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.lifetime_used_percent")
+    let life = lifetime_seconds(not_before, not_after)!
+    let used = (epoch_seconds(now) - epoch_seconds(not_before)) * 100 / life
+    if used < 0
+        Ok(0)
+    else if used > 100
+        Ok(100)
+    else
+        Ok(used)
 
 // Read an RFC 3339 timestamp off an ACME object.
 //
@@ -136,7 +169,13 @@ pub fn lifetime_used_percent(not_before: CivilDateTime, not_after: CivilDateTime
 // wrong, which is the difference between a report an operator can act
 // on and "bad date".
 pub fn parse_timestamp(field: Str, value: Str) -> Result<CivilDateTime, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.parse_timestamp")
+    match iso8601.parse_rfc3339(value)
+        Err(_)              => Err(AcmeRenewBadTimestamp(field, value))
+        Ok((local, offset)) =>
+            match arith.add_delta(local, span.minutes(0 - offset))
+                Ok(utc) => Ok(utc)
+                // cov: skip — RFC 3339 allows years to 9999 and offsets under a day, and the calendar holds nine-digit years
+                Err(_)  => Err(AcmeRenewDateOutOfRange)
 
 // When an order stops being usable, off its `expires` field.
 //
@@ -144,7 +183,7 @@ pub fn parse_timestamp(field: Str, value: Str) -> Result<CivilDateTime, AcmeRene
 // and a client that kept a `pending` order across a restart has to know
 // that the one it saved may be gone.
 pub fn order_expires_at(order: AcmeOrder) -> Result<CivilDateTime, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.order_expires_at")
+    parse_timestamp("expires", order.expires)
 
 // When an authorization stops being usable.
 //
@@ -154,7 +193,7 @@ pub fn order_expires_at(order: AcmeOrder) -> Result<CivilDateTime, AcmeRenewFaul
 // challenge at all, which is a case a client that always expects to
 // solve a challenge treats as an error.
 pub fn authorization_expires_at(authz: AcmeAuthorization) -> Result<CivilDateTime, AcmeRenewFault> []
-    todo("acme-nv.acmerenew.authorization_expires_at")
+    parse_timestamp("expires", authz.expires)
 
 // Whether an order arrived already satisfied by cached authorizations.
 //
@@ -162,7 +201,9 @@ pub fn authorization_expires_at(authz: AcmeAuthorization) -> Result<CivilDateTim
 // happy path a client must not treat as an anomaly: nothing has to be
 // published, and the next step is finalise.
 pub fn order_needs_no_challenge(order: AcmeOrder) -> Bool []
-    todo("acme-nv.acmerenew.order_needs_no_challenge")
+    match order.status
+        AcmeOrderReady => true
+        _              => false
 
 // How long to wait before polling again, in seconds, given how many
 // attempts have already been made.
@@ -171,7 +212,12 @@ pub fn order_needs_no_challenge(order: AcmeOrder) -> Bool []
 // count — so a test asserts the schedule without sleeping through it,
 // and the caller owns the sleep.
 pub fn poll_backoff_seconds(attempt: Int) -> Int []
-    todo("acme-nv.acmerenew.poll_backoff_seconds")
+    if attempt <= 0
+        1
+    else if attempt >= 6
+        60
+    else
+        1 << attempt
 
 // What went wrong planning a renewal, in one line.
 //
@@ -183,4 +229,35 @@ pub fn poll_backoff_seconds(attempt: Int) -> Int []
 // ```
 impl Error for AcmeRenewFault
     fn message(self) -> Str
-        todo("acme-nv.acmerenew.AcmeRenewFault.message")
+        match self
+            AcmeRenewBadTimestamp(f, v) => "the member `${f}` holds `${v}`, which is not an RFC 3339 timestamp"
+            AcmeRenewInvertedLifetime   => "the certificate does not expire after it starts"
+            AcmeRenewBadFraction(n, d)  => "${n}/${d} is not a fraction strictly between zero and one"
+            AcmeRenewDateOutOfRange     => "the date arithmetic left the range of years the calendar holds"
+
+// Whole seconds since the epoch, dropping the fraction of a second.
+fn epoch_seconds(dt: CivilDateTime) -> Int []
+    civil.epoch_day(dt.date) * 86400 + dt.time.hour * 3600 + dt.time.minute * 60 + dt.time.second
+
+// Division that rounds toward negative infinity, so a moment before
+// the epoch and a moment already past expiry fall on the earlier day.
+fn floor_div(n: Int, d: Int) -> Int []
+    if n >= 0
+        n / d
+    else
+        0 - (0 - n + d - 1) / d
+
+// The length of a lifetime in seconds, refused when it is not positive.
+fn lifetime_seconds(not_before: CivilDateTime,
+                    not_after: CivilDateTime) -> Result<Int, AcmeRenewFault> []
+    let life = epoch_seconds(not_after) - epoch_seconds(not_before)
+    if life <= 0
+        Err(AcmeRenewInvertedLifetime)
+    else
+        Ok(life)
+
+// A moment moved by a number of seconds, forward or back.
+fn shifted(dt: CivilDateTime, seconds: Int) -> Result<CivilDateTime, AcmeRenewFault> []
+    match arith.add_delta(dt, span.seconds(seconds))
+        Ok(moved) => Ok(moved)
+        Err(_)    => Err(AcmeRenewDateOutOfRange)

@@ -1,6 +1,5 @@
 // acmecsr.nv — the certificate request, and the field nobody reads.
 //
-// Every body here is a `todo()`; the signatures are the design.
 // Every row is `[]`.
 //
 // THE SUBJECT IS IGNORED AND THE SAN EXTENSION IS THE REQUEST.  A
@@ -37,6 +36,17 @@
 // asn1-nv's `ecdsa_signature_der` and `ecdsa_signature_rs` convert
 // between them, and a client that used one form for both has one of
 // the two refused with a message about an invalid signature.
+
+use std.bytes
+use std.list
+use acmejws
+use acmemsg
+use asn1err
+use asn1oid
+use asn1pkix
+use asn1read
+use asn1univ
+use asn1write
 
 // A PKCS#10 subject this package writes: the empty Name.
 //
@@ -78,7 +88,40 @@ pub enum AcmeCsrScheme
 // empty.  The public key is a DER SubjectPublicKeyInfo — asn1-nv's
 // `write_spki` and `ec_spki` produce one from a P-256 key.
 pub fn csr_info(names: [Str], spki: Bytes, limit: Int) -> Result<Bytes, AcmeCsrFault> []
-    todo("acme-nv.acmecsr.csr_info")
+    if list.len(names) == 0
+        return Err(AcmeCsrNoNames)
+    if list.len(names) > limit
+        return Err(AcmeCsrTooManyNames(list.len(names), limit))
+    for name in names
+        if not name_is_wellformed(name)
+            return Err(AcmeCsrNotADnsName(name))
+    let spki_ok = match asn1pkix.parse_spki(spki, asn1read.default_limits())
+        Err(_) => false
+        Ok(_)  => true
+    if not spki_ok
+        return Err(AcmeCsrBadPublicKey)
+    let general_names = general_names_der(names)!
+    var b = asn1write.builder(asn1write.build_limits())
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.put_integer(b, 0))!
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.put_encoded(b, spki))!
+    b = enc(asn1write.begin_explicit(b, 0))!
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.put_oid(b, extension_request_oid()))!
+    b = enc(asn1write.begin_set(b))!
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.put_oid(b, asn1oid.oid_subject_alt_name()))!
+    b = enc(asn1write.put_octet_string(b, general_names))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.end(b))!
+    finish(b)
 
 // The whole certification request, from the info bytes and a signature
 // over them.
@@ -88,12 +131,27 @@ pub fn csr_info(names: [Str], spki: Bytes, limit: Int) -> Result<Bytes, AcmeCsrF
 // carries.  `AcmeCsrBadSignature` names that when the length says the
 // wrong one arrived.
 pub fn csr(info: Bytes, scheme: AcmeCsrScheme, signature: Bytes) -> Result<Bytes, AcmeCsrFault> []
-    todo("acme-nv.acmecsr.csr")
+    malformed(asn1read.expect_at(info, 0, 16, asn1read.default_limits()))!
+    check_signature(scheme, signature)!
+    var b = asn1write.builder(asn1write.build_limits())
+    b = enc(asn1write.begin_sequence(b))!
+    b = enc(asn1write.put_encoded(b, info))!
+    b = enc(asn1write.begin_sequence(b))!
+    match scheme
+        AcmeCsrEcdsaP256Sha256 =>
+            b = enc(asn1write.put_oid(b, asn1oid.oid_ecdsa_with_sha256()))!
+        AcmeCsrRsaSha256       =>
+            b = enc(asn1write.put_oid(b, asn1oid.oid_sha256_with_rsa()))!
+            b = enc(asn1write.put_null(b))!
+    b = enc(asn1write.end(b))!
+    b = enc(asn1write.put_bit_string(b, 0, signature))!
+    b = enc(asn1write.end(b))!
+    finish(b)
 
 // A certification request as a finalise payload carries it: base64url
 // of the DER, without padding.
 pub fn csr_text(der: Bytes) -> Str []
-    todo("acme-nv.acmecsr.csr_text")
+    acmejws.base64url(der)
 
 // The DNS names a certification request asks for, out of its SAN
 // extension.
@@ -101,7 +159,25 @@ pub fn csr_text(der: Bytes) -> Str []
 // The SAN and not the subject, for the reason at the top of this
 // module.
 pub fn names_of(der: Bytes) -> Result<[Str], AcmeCsrFault> []
-    todo("acme-nv.acmecsr.names_of")
+    let limits = asn1read.default_limits()
+    let top = malformed(asn1univ.sequence_at(der, 0, limits))!
+    if list.len(top) < 3
+        return Err(AcmeCsrMalformed(0))
+    let info = malformed(asn1univ.sequence_at(der, top[0].off, limits))!
+    var names: [Str] = []
+    if list.len(info) < 4
+        return Ok(names)
+    let attributes = malformed(asn1read.children_at(der, info[3].off, limits))!
+    for attr in attributes
+        let parts = malformed(asn1univ.sequence_at(der, attr.off, limits))!
+        if list.len(parts) == 2
+            let kind = malformed(asn1univ.oid_at(der, parts[0].off, limits))!
+            if asn1oid.equals(kind, extension_request_oid())
+                let values = malformed(asn1univ.set_at(der, parts[1].off, limits))!
+                for value in values
+                    for found in extension_names(der, value.off)!
+                        list.push(names, found)
+    Ok(names)
 
 // Whether a certification request's names are exactly an order's
 // identifiers — no more and no fewer, in any order.
@@ -110,13 +186,23 @@ pub fn names_of(der: Bytes) -> Result<[Str], AcmeCsrFault> []
 // refused at finalise is `invalid` and cannot be retried: the whole
 // issuance starts again, including the challenges.
 pub fn names_match(der: Bytes, identifiers: [AcmeIdentifier]) -> Result<Bool, AcmeCsrFault> []
-    todo("acme-nv.acmecsr.names_match")
+    let found = names_of(der)!
+    let want = identifier_names(identifiers)
+    Ok(same_names(found, want))
 
 // The first name the two disagree about, for a caller that wants to
 // report rather than retry.
 pub fn first_name_disagreement(der: Bytes,
                                identifiers: [AcmeIdentifier]) -> Result<?AcmeCsrFault, AcmeCsrFault> []
-    todo("acme-nv.acmecsr.first_name_disagreement")
+    let found = names_of(der)!
+    let want = identifier_names(identifiers)
+    for name in found
+        if not list.contains(want, name)
+            return Ok(Some(AcmeCsrNamesDisagree(name, false)))
+    for name in want
+        if not list.contains(found, name)
+            return Ok(Some(AcmeCsrNamesDisagree(name, true)))
+    Ok(None)
 
 // The names an order asks a certificate for, in the form a
 // certification request writes them.
@@ -125,23 +211,48 @@ pub fn first_name_disagreement(der: Bytes,
 // carries the star, which is the one place in this flow where the
 // wildcard is written literally.
 pub fn names_for_order(order: AcmeOrder) -> Result<[Str], AcmeCsrFault> []
-    todo("acme-nv.acmecsr.names_for_order")
+    var names: [Str] = []
+    for id in order.identifiers
+        match id.kind
+            AcmeDnsIdentifier =>
+                if not name_is_wellformed(id.value)
+                    return Err(AcmeCsrNotADnsName(id.value))
+                list.push(names, id.value)
+            _                 =>
+                return Err(AcmeCsrNotADnsName(id.value))
+    if list.len(names) == 0
+        Err(AcmeCsrNoNames)
+    else
+        Ok(names)
 
 // Whether a DNS name may go in a SAN.
 pub fn name_is_wellformed(name: Str) -> Bool []
-    todo("acme-nv.acmecsr.name_is_wellformed")
+    let base = if str.starts_with(name, "*.")
+        str.slice(name, 2, str.len(name))
+    else
+        name
+    if str.len(base) == 0 or str.len(base) > 251
+        return false
+    for label in str.split(base, ".")
+        if not label_is_wellformed(label)
+            return false
+    true
 
 // The signature scheme's OID text, for a caller that has to report
 // what it built.
 pub fn scheme_oid_text(scheme: AcmeCsrScheme) -> Str []
-    todo("acme-nv.acmecsr.scheme_oid_text")
+    match scheme
+        AcmeCsrEcdsaP256Sha256 => asn1oid.oid_text(asn1oid.oid_ecdsa_with_sha256())
+        AcmeCsrRsaSha256       => asn1oid.oid_text(asn1oid.oid_sha256_with_rsa())
 
 // How long a signature of this scheme is, for the check `csr` performs.
 //
 // 0 for RSA, whose signature length is the key's rather than the
 // algorithm's — so the check is skipped rather than guessed.
 pub fn signature_len_for(scheme: AcmeCsrScheme) -> Int []
-    todo("acme-nv.acmecsr.signature_len_for")
+    match scheme
+        AcmeCsrEcdsaP256Sha256 => 64
+        AcmeCsrRsaSha256       => 0
 
 // What went wrong building a certificate request, in one line.
 //
@@ -153,4 +264,144 @@ pub fn signature_len_for(scheme: AcmeCsrScheme) -> Int []
 // ```
 impl Error for AcmeCsrFault
     fn message(self) -> Str
-        todo("acme-nv.acmecsr.AcmeCsrFault.message")
+        match self
+            AcmeCsrNoNames                    => "the request names nothing"
+            AcmeCsrNotADnsName(v)             => "`${v}` is not a DNS name for a subjectAltName"
+            AcmeCsrTooManyNames(n, l)         => "${n} names exceeds the limit of ${l}"
+            AcmeCsrBadPublicKey               => "the public key is not a SubjectPublicKeyInfo"
+            AcmeCsrBadSignature(d)            => "the signature is not usable: ${d}"
+            AcmeCsrMalformed(o)               => "the DER is malformed at offset ${o}"
+            AcmeCsrNamesDisagree(n, in_order) => if in_order
+                "the order asks for `${n}` and the request does not"
+            else
+                "the request asks for `${n}` and the order does not"
+
+// The extensionRequest attribute's object identifier, which carries
+// the extensions a PKCS#10 request asks for.
+fn extension_request_oid() -> AsnOid []
+    asn1oid.oid([1, 2, 840, 113549, 1, 9, 14])
+
+// An encoder's refusal as this module's fault.  An encoder refuses
+// only for a value too large or a bad nesting, neither of which the
+// fixed shape here can reach, so the offset is 0.
+fn enc(r: Result<AsnBuilder, AsnEncodeError>) -> Result<AsnBuilder, AcmeCsrFault> []
+    match r
+        Ok(b)  => Ok(b)
+        // cov: skip — the builder refuses only a nesting deeper than 64 or a value over 16 MiB, and the shapes built here are a fixed few levels of at most 100 short names
+        Err(_) => Err(AcmeCsrMalformed(0))
+
+// The finished DER, or the fault.
+fn finish(b: AsnBuilder) -> Result<Bytes, AcmeCsrFault> []
+    match asn1write.done(b)
+        Ok(der) => Ok(der)
+        // cov: skip — done refuses only an unclosed value, and every begin above has its end
+        Err(_)  => Err(AcmeCsrMalformed(0))
+
+// A DER length for a name, which is at most 253 bytes: the short form
+// below 128 and the one-byte long form above.
+fn der_length(n: Int) -> Bytes []
+    if n < 128
+        bytes.u8(n)
+    else
+        bytes.concat([bytes.u8(129), bytes.u8(n)])
+
+// `GeneralNames`: a SEQUENCE of `dNSName [2] IA5String`, each
+// primitive and implicitly tagged, so the tag byte is 0x82.
+fn general_names_der(names: [Str]) -> Result<Bytes, AcmeCsrFault> []
+    var items: [Bytes] = []
+    for name in names
+        let text = bytes.from_str(name)
+        list.push(items, bytes.concat([bytes.u8(130), der_length(bytes.len(text)), text]))
+    var b = asn1write.builder(asn1write.build_limits())
+    b = enc(asn1write.begin_sequence(b))!
+    for item in items
+        b = enc(asn1write.put_encoded(b, item))!
+    b = enc(asn1write.end(b))!
+    finish(b)
+
+// The dNSName entries of the subjectAltName extension in one
+// Extensions SEQUENCE, found at `off`.
+fn extension_names(der: Bytes, off: Int) -> Result<[Str], AcmeCsrFault> []
+    let limits = asn1read.default_limits()
+    var names: [Str] = []
+    let extensions = malformed(asn1univ.sequence_at(der, off, limits))!
+    for ext in extensions
+        let parts = malformed(asn1univ.sequence_at(der, ext.off, limits))!
+        if list.len(parts) >= 2
+            let kind = malformed(asn1univ.oid_at(der, parts[0].off, limits))!
+            if asn1oid.equals(kind, asn1oid.oid_subject_alt_name())
+                let inner = malformed(asn1univ.octet_string_at(der, parts[list.len(parts) - 1].off, limits))!
+                for entry in malformed(asn1univ.sequence_at(inner, 0, limits))!
+                    let tag = malformed(asn1read.peek_tag_at(inner, entry.off, limits))!
+                    if tag.number == 2 and tag.class == AsnContext
+                        let content = malformed(asn1read.implicit_at(inner, entry.off, 2, limits))!
+                        list.push(names, bytes.to_str(asn1read.span_bytes(inner, content)))
+    Ok(names)
+
+// A decoder's refusal as this module's fault, carrying the offset the
+// decoder gave up at.
+fn malformed<T>(r: Result<T, AsnDecodeError>) -> Result<T, AcmeCsrFault> []
+    match r
+        Ok(v)  => Ok(v)
+        Err(e) => Err(AcmeCsrMalformed(asn1err.decode_offset(e)))
+
+// The values of the DNS identifiers, lowercased: DNS names compare
+// without regard to case.
+fn identifier_names(identifiers: [AcmeIdentifier]) -> [Str] []
+    var names: [Str] = []
+    for id in identifiers
+        list.push(names, str.lower(id.value))
+    names
+
+// Whether two name lists hold the same names, in any order and
+// counting a repeated name once.
+fn same_names(found: [Str], want: [Str]) -> Bool []
+    var lowered: [Str] = []
+    for name in found
+        list.push(lowered, str.lower(name))
+    for name in lowered
+        if not list.contains(want, name)
+            return false
+    for name in want
+        if not list.contains(lowered, name)
+            return false
+    true
+
+// A label of letters, digits and inner hyphens, 1 to 63 characters.
+fn label_is_wellformed(label: Str) -> Bool []
+    let n = str.len(label)
+    if n < 1 or n > 63
+        return false
+    if str.byte_at_or(label, 0, 0) == '-' or str.byte_at_or(label, n - 1, 0) == '-'
+        return false
+    for i in 0..n
+        let c = str.byte_at_or(label, i, 0)
+        let ok = c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or c == '-'
+        if not ok
+            return false
+    true
+
+// A signature checked for the shape its scheme gives it in a
+// certificate request.  ECDSA's is the DER SEQUENCE of two INTEGERs;
+// a signature of the JWS width, 64 bytes, that is not that SEQUENCE
+// is the fixed-width form, and the fault says so.
+fn check_signature(scheme: AcmeCsrScheme, signature: Bytes) -> Result<Bool, AcmeCsrFault> []
+    match scheme
+        AcmeCsrRsaSha256       =>
+            if bytes.len(signature) == 0
+                Err(AcmeCsrBadSignature("the signature is empty"))
+            else
+                Ok(true)
+        AcmeCsrEcdsaP256Sha256 =>
+            let limits = asn1read.default_limits()
+            match asn1univ.sequence_at(signature, 0, limits)
+                Err(_)    =>
+                    if bytes.len(signature) == signature_len_for(scheme)
+                        Err(AcmeCsrBadSignature("it is 64 bytes, the fixed-width r then s a JWS carries; a certificate request wants the DER SEQUENCE"))
+                    else
+                        Err(AcmeCsrBadSignature("it is not a DER SEQUENCE of two INTEGERs"))
+                Ok(parts) =>
+                    if list.len(parts) != 2
+                        Err(AcmeCsrBadSignature("the SEQUENCE does not hold exactly r and s"))
+                    else
+                        Ok(true)

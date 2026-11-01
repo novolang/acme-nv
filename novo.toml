@@ -1,15 +1,13 @@
 [package]
 name        = "acme-nv"
-version     = "0.0.2"
-description = "An ACME client (RFC 8555): account creation, orders, the HTTP-01 and DNS-01 challenges as values a caller serves itself, CSR generation over asn1-nv, finalisation, certificate download and renewal planning.  The message shapes and the JWS signing are sans-IO; the client is a thin pump over std.http.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "An ACME client (RFC 8555): account creation, orders, the HTTP-01 and DNS-01 challenges as values a caller serves itself, CSR generation over asn1-nv, finalisation, certificate download and renewal planning.  The message shapes and the JWS signing are sans-IO; the client is a thin pump over std.http."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental`: the tests were written against the signatures and a
+# local ACME server, and no program outside this repository has used
+# the package yet.
+stability   = "experimental"
 
 # `host`, and FIVE OF THE SIX MODULES DECLARE NOTHING.  `acmemsg` is
 # the message shapes and every row in it is `[]`; so are `acmejws`'s
@@ -31,7 +29,7 @@ category    = "crypto"
 tags        = ["acme", "rfc8555", "certificates", "letsencrypt", "http-01", "dns-01", "jws"]
 repository  = "https://github.com/novolang/acme-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.22.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -40,24 +38,20 @@ novo        = ">= 0.8.9"
 "README.md" = "Getting a certificate issued, and keeping it"
 
 [dependencies]
-# `JwtAlg`, `JwtSigningKey` and `ec_signing_key` — the key vocabulary
-# an ACME JWS is signed with.  What jwt-nv does NOT publish is a raw
-# signer over arbitrary bytes, and the README's "What is missing"
-# section names that row: ACME's JWS is the FLATTENED JSON
-# serialisation over a protected header with a nonce and a URL in it,
-# not a JWT's compact form over claims, so `jwttoken.encode` is the
-# wrong shape and `jwttoken.signing_input` takes `JwtClaims`.
-jwt-nv = "^0.0.3"
+# `JwtAlg`, the algorithm vocabulary an ACME JWS names in its protected
+# header.  jwt-nv publishes no signer over arbitrary bytes, and an ACME
+# request is the flattened JSON serialisation rather than a JWT's
+# compact form, so the signing function is an argument of
+# `acmejws.signed_request`.
+jwt-nv = "^0.1"
 
-# The account key and the certificate key.  p256-nv carries ECDH and
-# not ECDSA, which is why `acmejws.signed_request` takes the signing
-# function as an argument — see the README.
-p256-nv = "^0.0.2"
+# The account key and the certificate key, and the ECDSA signing the
+# tests use.
+p256-nv = "^0.1"
 
-# The certificate request: `AsnName`, `AsnExtension`, the subjectAltName
-# OID, `write_spki` and `ecdsa_signature_der`.  `acmecsr` builds
-# PKCS#10 out of these and encodes no DER of its own.
-asn1-nv = "^0.0.1"
+# The certificate request: `AsnOid`, the DER builder, the reader and
+# `ecdsa_signature_der`.  `acmecsr` builds PKCS#10 out of these.
+asn1-nv = "^0.1"
 
 # SHA-256, for RFC 7638's JWK thumbprint and for the DNS-01 record's
 # value.  Both are a digest of a string this package builds, and both
@@ -69,8 +63,8 @@ crypto-nv = "^0.1"
 # the DER certificate request in a finalise payload.  ACME uses the URL
 # alphabet with the padding stripped everywhere, and a client that sent
 # standard base64 has its signature refused with no useful message.
-base64-nv = "^0.0.1"
+base64-nv = "^0.1"
 
 # Civil dates and `TimeDelta`, for renewal planning and for reading the
 # RFC 3339 timestamps an order and an authorization carry.
-calendar-nv = "^0.0.2"
+calendar-nv = "^0.2"

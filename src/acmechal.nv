@@ -1,7 +1,6 @@
 // acmechal.nv — the two challenges, as values a caller publishes
 // itself.
 //
-// Every body here is a `todo()`; the signatures are the design.
 // Every row is `[]`.
 //
 // THIS PACKAGE DOES NOT SERVE THE CHALLENGE AND DOES NOT UPDATE DNS,
@@ -44,6 +43,13 @@
 // `dns01_record_name` answers the same name for both and
 // `dns01_records_share_a_name` is the predicate that says so out loud.
 
+use std.bytes
+use std.list
+use acmecsr
+use acmejws
+use acmemsg
+use hashing
+
 // The prefix every DNS-01 record name carries.
 pub const ACME_DNS01_LABEL = "_acme-challenge"
 
@@ -78,7 +84,9 @@ pub enum AcmeChalFault
 // base64url characters only — no `/`, no `.`, no `%` — and at least
 // the entropy floor's worth of them.
 pub fn token_is_wellformed(token: Str) -> Bool []
-    todo("acme-nv.acmechal.token_is_wellformed")
+    match check_token(token)
+        Ok(_)  => true
+        Err(_) => false
 
 // The path an HTTP-01 challenge is served at.
 //
@@ -86,12 +94,16 @@ pub fn token_is_wellformed(token: Str) -> Bool []
 // answering a path, because the alternative is a caller writing a file
 // wherever a certificate authority's token told it to.
 pub fn http01_path(token: Str) -> Result<Str, AcmeChalFault> []
-    todo("acme-nv.acmechal.http01_path")
+    let t = check_token(token)!
+    Ok(ACME_HTTP01_PREFIX + t)
 
 // The exact bytes an HTTP-01 challenge file contains: the key
 // authorization, with no trailing newline.
 pub fn http01_body(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFault> []
-    todo("acme-nv.acmechal.http01_body")
+    let t = check_token(token)!
+    match acmejws.key_authorization(t, jwk_json)
+        Ok(k)  => Ok(k)
+        Err(e) => Err(AcmeChalKeyAuthorizationRefused(e.message()))
 
 // The full URL the server will fetch, for a caller that wants to check
 // its own setup before telling the server to look.
@@ -100,7 +112,10 @@ pub fn http01_body(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFault> []
 // follow a redirect to HTTPS — which is how a site that redirects
 // everything still passes.
 pub fn http01_url(domain: Str, token: Str) -> Result<Str, AcmeChalFault> []
-    todo("acme-nv.acmechal.http01_url")
+    if str.starts_with(domain, "*.") or not acmecsr.name_is_wellformed(domain)
+        return Err(AcmeChalNotADnsName(domain))
+    let target = http01_path(token)!
+    Ok("http://" + domain + target)
 
 // The `Content-Type` an HTTP-01 response should carry, which is
 // `application/octet-stream` — or nothing at all.
@@ -110,14 +125,18 @@ pub fn http01_url(domain: Str, token: Str) -> Result<Str, AcmeChalFault> []
 // the challenge fails with a message about the response not matching
 // rather than about the file being absent.
 pub fn http01_content_type() -> Str []
-    todo("acme-nv.acmechal.http01_content_type")
+    "application/octet-stream"
 
 // The TXT record name for a domain: `_acme-challenge.<base name>`.
 //
 // The SAME name for `example.com` and for `*.example.com`, which is
 // why an order for both needs two records at one name.
 pub fn dns01_record_name(domain: Str) -> Result<Str, AcmeChalFault> []
-    todo("acme-nv.acmechal.dns01_record_name")
+    let base = acmemsg.base_name(acmemsg.dns_identifier(domain))
+    if not acmecsr.name_is_wellformed(base)
+        Err(AcmeChalNotADnsName(domain))
+    else
+        Ok(ACME_DNS01_LABEL + "." + base)
 
 // The TXT record's value: base64url of the SHA-256 of the key
 // authorization.
@@ -126,7 +145,10 @@ pub fn dns01_record_name(domain: Str) -> Result<Str, AcmeChalFault> []
 // string is limited to 255 characters and a key authorization is
 // longer than that.
 pub fn dns01_record_value(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFault> []
-    todo("acme-nv.acmechal.dns01_record_value")
+    let t = check_token(token)!
+    match acmejws.key_authorization(t, jwk_json)
+        Err(e) => Err(AcmeChalKeyAuthorizationRefused(e.message()))
+        Ok(k)  => Ok(acmejws.base64url(hashing.sha256(bytes.from_str(k))))
 
 // Whether two identifiers need their TXT records at the same name.
 //
@@ -135,11 +157,16 @@ pub fn dns01_record_value(token: Str, jwk_json: Str) -> Result<Str, AcmeChalFaul
 // the second challenge's value removes the first's, and the first
 // challenge then fails.  Both values have to be present at once.
 pub fn dns01_records_share_a_name(a: AcmeIdentifier, b: AcmeIdentifier) -> Bool []
-    todo("acme-nv.acmechal.dns01_records_share_a_name")
+    acmemsg.base_name(a) == acmemsg.base_name(b)
 
 // Every distinct TXT record name an order needs, deduplicated.
 pub fn dns01_names_for(identifiers: [AcmeIdentifier]) -> Result<[Str], AcmeChalFault> []
-    todo("acme-nv.acmechal.dns01_names_for")
+    var names: [Str] = []
+    for id in identifiers
+        let name = dns01_record_name(id.value)!
+        if not list.contains(names, name)
+            list.push(names, name)
+    Ok(names)
 
 // Whether a challenge kind can answer this identifier.
 //
@@ -147,12 +174,28 @@ pub fn dns01_names_for(identifiers: [AcmeIdentifier]) -> Result<[Str], AcmeChalF
 // HTTP-01 for one has told the server to fetch a file from a host that
 // the wildcard does not name.
 pub fn kind_can_answer(kind: AcmeChallengeKind, id: AcmeIdentifier) -> Bool []
-    todo("acme-nv.acmechal.kind_can_answer")
+    match id.kind
+        AcmeDnsIdentifier =>
+            match kind
+                AcmeDns01  => true
+                AcmeHttp01 => not acmemsg.is_wildcard(id)
+                _          => false
+        _                 => false
 
 // The challenge in an authorization this package can actually prepare,
 // preferring the kind the caller named.
 pub fn preferred_challenge(authz: AcmeAuthorization, prefer: AcmeChallengeKind) -> ?AcmeChallenge []
-    todo("acme-nv.acmechal.preferred_challenge")
+    let id = if authz.wildcard
+        AcmeIdentifier { kind: authz.identifier.kind, value: "*." + authz.identifier.value }
+    else
+        authz.identifier
+    match acmemsg.challenge_by_kind(authz, prefer)
+        Some(c) =>
+            if kind_can_answer(prefer, id)
+                return Some(c)
+        None    =>
+            return first_answering(authz.challenges, id)
+    first_answering(authz.challenges, id)
 
 // How long a caller should wait for a DNS change to be visible before
 // telling the server to look, in seconds.
@@ -163,7 +206,13 @@ pub fn preferred_challenge(authz: AcmeAuthorization, prefer: AcmeChallengeKind) 
 // resolver's cached NXDOMAIN and a failed challenge it then cannot
 // retry on the same order.
 pub fn dns01_propagation_advice(negative_ttl_seconds: Int) -> Int []
-    todo("acme-nv.acmechal.dns01_propagation_advice")
+    let wait = negative_ttl_seconds + 10
+    if wait < 30
+        30
+    else if wait > 3600
+        3600
+    else
+        wait
 
 // What went wrong preparing a challenge, in one line.
 //
@@ -175,4 +224,46 @@ pub fn dns01_propagation_advice(negative_ttl_seconds: Int) -> Int []
 // ```
 impl Error for AcmeChalFault
     fn message(self) -> Str
-        todo("acme-nv.acmechal.AcmeChalFault.message")
+        match self
+            AcmeChalTokenNotWellformed(at)     => "the token has a character outside base64url at position ${at}"
+            AcmeChalTokenTooShort(n, least)    => "the token is ${n} characters; at least ${least} carry the 128 bits RFC 8555 section 11.3 asks for"
+            AcmeChalKindUnsupported(k)         => "this package does not prepare a ${acmemsg.challenge_kind_name(k)} challenge"
+            AcmeChalKeyAuthorizationRefused(d) => "the key authorization could not be built: ${d}"
+            AcmeChalNotADnsName(v)             => "`${v}` is not a DNS name"
+
+// The fewest characters a token may have: 22 base64url characters
+// carry the 128 bits of entropy RFC 8555 section 11.3 asks for.
+const TOKEN_LEAST = 22
+
+// The most characters a token may have.  The RFC sets no ceiling; a
+// token longer than this is a server misbehaving, and it is refused
+// before it becomes part of a path.
+const TOKEN_MOST = 1024
+
+// Whether a byte is in base64url's alphabet.
+fn is_token_byte(b: Int) -> Bool []
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9' or b == '-' or b == '_'
+
+// A token checked for the alphabet and for the length, answered
+// unchanged.  The alphabet comes first, so a path-traversal token is
+// reported at the character that makes it one.
+fn check_token(token: Str) -> Result<Str, AcmeChalFault> []
+    let n = str.len(token)
+    var at = 0
+    while at < n and at < TOKEN_MOST
+        if not is_token_byte(str.byte_at_or(token, at, 0))
+            return Err(AcmeChalTokenNotWellformed(at))
+        at += 1
+    if n > TOKEN_MOST
+        Err(AcmeChalTokenNotWellformed(TOKEN_MOST))
+    else if n < TOKEN_LEAST
+        Err(AcmeChalTokenTooShort(n, TOKEN_LEAST))
+    else
+        Ok(token)
+
+// The first challenge in a list that can answer the identifier.
+fn first_answering(challenges: [AcmeChallenge], id: AcmeIdentifier) -> ?AcmeChallenge []
+    for c in challenges
+        if kind_can_answer(c.kind, id)
+            return Some(c)
+    None

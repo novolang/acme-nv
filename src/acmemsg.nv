@@ -1,6 +1,5 @@
 // acmemsg.nv — the objects an ACME server serves, as values.
 //
-// Every body here is a `todo()`; the signatures are the design.
 // Every row is `[]`.
 //
 // THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE.  Nothing here
@@ -32,6 +31,11 @@
 // matched authorizations to identifiers by string never finds the one
 // it is looking for.  `AcmeAuthorization.wildcard` is the field that
 // closes it and `identifier_for` is the lookup that uses it.
+
+use std.list
+
+// The prefix of every error type RFC 8555 section 6.7 defines.
+const ERROR_PREFIX = "urn:ietf:params:acme:error:"
 
 // The directory: every URL a client needs, fetched once.
 //
@@ -222,11 +226,35 @@ pub struct AcmeMsgLimits
 
 // Limits a program ordering its own certificates is comfortable with.
 pub fn default_limits() -> AcmeMsgLimits []
-    todo("acme-nv.acmemsg.default_limits")
+    AcmeMsgLimits { max_identifiers: 100, max_authorizations: 100, max_challenges: 16,
+                    max_subproblems: 100, max_body_bytes: 1048576 }
 
 // Parse the directory document.
 pub fn parse_directory(body: Str, limits: AcmeMsgLimits) -> Result<AcmeDirectory, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_directory")
+    let v = parse_object(body, limits)!
+    let new_nonce = req_str(v, "newNonce")!
+    let new_account = req_str(v, "newAccount")!
+    let new_order = req_str(v, "newOrder")!
+    let revoke_cert = req_str(v, "revokeCert")!
+    let key_change = opt_str(v, "keyChange")!
+    var terms = ""
+    var website = ""
+    var caa: [Str] = []
+    var external = false
+    match present(v, "meta")
+        None    =>
+            terms = ""
+        Some(m) =>
+            if json.type_of(m) != "object"
+                return Err(AcmeMsgFieldWrongKind("meta", "object"))
+            terms = opt_str(m, "termsOfService")!
+            website = opt_str(m, "website")!
+            caa = opt_str_list(m, "caaIdentities", limits.max_identifiers)!
+            external = opt_bool(m, "externalAccountRequired")!
+    Ok(AcmeDirectory { new_nonce: new_nonce, new_account: new_account, new_order: new_order,
+                       revoke_cert: revoke_cert, key_change: key_change,
+                       terms_of_service: terms, website: website, caa_identities: caa,
+                       external_account_required: external })
 
 // Parse an account object.
 //
@@ -234,24 +262,62 @@ pub fn parse_directory(body: Str, limits: AcmeMsgLimits) -> Result<AcmeDirectory
 // an argument here rather than something this function could find.
 pub fn parse_account(body: Str, url: Str,
                      limits: AcmeMsgLimits) -> Result<AcmeAccount, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_account")
+    let v = parse_object(body, limits)!
+    let status = account_status(req_str(v, "status")!)!
+    let contact = opt_str_list(v, "contact", limits.max_identifiers)!
+    let agreed = opt_bool(v, "termsOfServiceAgreed")!
+    let orders = opt_str(v, "orders")!
+    Ok(AcmeAccount { url: url, status: status, contact: contact, terms_agreed: agreed,
+                     orders: orders })
 
 // Parse an order object, with the URL the reply's `Location` carried.
 pub fn parse_order(body: Str, url: Str, limits: AcmeMsgLimits) -> Result<AcmeOrder, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_order")
+    let v = parse_object(body, limits)!
+    let status = order_status(req_str(v, "status")!)!
+    let ids = parse_identifiers(v, "identifiers", limits.max_identifiers)!
+    if list.len(ids) == 0
+        return Err(AcmeMsgNoIdentifiers)
+    let authz = req_str_list(v, "authorizations", limits.max_authorizations)!
+    let finalize = req_str(v, "finalize")!
+    var problem: ?AcmeProblem = None
+    match present(v, "error")
+        None    =>
+            problem = None
+        Some(e) =>
+            problem = Some(problem_of_value(e, limits, 0)!)
+    Ok(AcmeOrder { url: url, status: status, expires: opt_str(v, "expires")!, identifiers: ids,
+                   authorizations: authz, finalize: finalize,
+                   certificate: opt_str(v, "certificate")!,
+                   not_before: opt_str(v, "notBefore")!, not_after: opt_str(v, "notAfter")!,
+                   problem: problem })
 
 // Parse an authorization object.
 pub fn parse_authorization(body: Str, url: Str,
                            limits: AcmeMsgLimits) -> Result<AcmeAuthorization, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_authorization")
+    let v = parse_object(body, limits)!
+    let status = authz_status(req_str(v, "status")!)!
+    let idv = match present(v, "identifier")
+        None    =>
+            return Err(AcmeMsgFieldMissing("identifier"))
+        Some(x) => x
+    let id = identifier_of_value(idv)!
+    var challenges: [AcmeChallenge] = []
+    let items = req_list(v, "challenges", limits.max_challenges)!
+    for item in items
+        list.push(challenges, challenge_of_value(item, limits)!)
+    Ok(AcmeAuthorization { url: url, identifier: id, status: status,
+                           expires: opt_str(v, "expires")!, wildcard: opt_bool(v, "wildcard")!,
+                           challenges: challenges })
 
 // Parse a challenge object.
 pub fn parse_challenge(body: Str, limits: AcmeMsgLimits) -> Result<AcmeChallenge, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_challenge")
+    let v = parse_object(body, limits)!
+    challenge_of_value(v, limits)
 
 // Parse a problem document.
 pub fn parse_problem(body: Str, limits: AcmeMsgLimits) -> Result<AcmeProblem, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.parse_problem")
+    let v = parse_object(body, limits)!
+    problem_of_value(v, limits, 0)
 
 // The newAccount request payload.
 //
@@ -259,16 +325,42 @@ pub fn parse_problem(body: Str, limits: AcmeMsgLimits) -> Result<AcmeProblem, Ac
 // to terms on somebody's behalf is not a thing a library does.
 pub fn write_new_account(contact: [Str], terms_agreed: Bool,
                          only_return_existing: Bool) -> Result<Str, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.write_new_account")
+    for c in contact
+        if c == ""
+            return Err(AcmeMsgFieldWrongKind("contact", "a URL such as mailto:ops@example.com"))
+    var kvs: [(Str, JsonValueH)] = []
+    if list.len(contact) > 0
+        var items: [JsonValueH] = []
+        for c in contact
+            list.push(items, json.string(c))
+        list.push(kvs, ("contact", json.array(items)))
+    if terms_agreed
+        list.push(kvs, ("termsOfServiceAgreed", json.bool(true)))
+    if only_return_existing
+        list.push(kvs, ("onlyReturnExisting", json.bool(true)))
+    Ok(json.stringify(json.object(kvs)))
 
 // The newOrder request payload.
 pub fn write_new_order(identifiers: [AcmeIdentifier], not_before: Str,
                        not_after: Str) -> Result<Str, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.write_new_order")
+    if list.len(identifiers) == 0
+        return Err(AcmeMsgNoIdentifiers)
+    var ids: [JsonValueH] = []
+    for id in identifiers
+        list.push(ids, identifier_value(id))
+    var kvs: [(Str, JsonValueH)] = [("identifiers", json.array(ids))]
+    if not_before != ""
+        list.push(kvs, ("notBefore", json.string(not_before)))
+    if not_after != ""
+        list.push(kvs, ("notAfter", json.string(not_after)))
+    Ok(json.stringify(json.object(kvs)))
 
 // The finalise request payload: the certificate request, base64url.
 pub fn write_finalize(csr_base64url: Str) -> Result<Str, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.write_finalize")
+    if csr_base64url == ""
+        Err(AcmeMsgFieldMissing("csr"))
+    else
+        Ok(json.stringify(json.object([("csr", json.string(csr_base64url))])))
 
 // The payload that tells the server a challenge is ready to be checked.
 //
@@ -279,23 +371,29 @@ pub fn write_finalize(csr_base64url: Str) -> Result<Str, AcmeMsgFault> []
 // is the other one, and the two are separate functions for this
 // reason.
 pub fn write_challenge_ready() -> Str []
-    todo("acme-nv.acmemsg.write_challenge_ready")
+    "{}"
 
 // The revokeCert request payload.
 pub fn write_revoke(certificate_der_base64url: Str, reason: Int) -> Result<Str, AcmeMsgFault> []
-    todo("acme-nv.acmemsg.write_revoke")
+    if certificate_der_base64url == ""
+        Err(AcmeMsgFieldMissing("certificate"))
+    else if reason < 0 or reason > 10 or reason == 7
+        Err(AcmeMsgFieldWrongKind("reason", "an RFC 5280 reason code: 0 to 6 or 8 to 10"))
+    else
+        Ok(json.stringify(json.object([("certificate", json.string(certificate_der_base64url)),
+                                       ("reason", json.int(reason))])))
 
 // The payload that deactivates an account or an authorization.
 pub fn write_deactivate() -> Str []
-    todo("acme-nv.acmemsg.write_deactivate")
+    "{\"status\":\"deactivated\"}"
 
 // A DNS identifier.
 pub fn dns_identifier(name: Str) -> AcmeIdentifier []
-    todo("acme-nv.acmemsg.dns_identifier")
+    AcmeIdentifier { kind: AcmeDnsIdentifier, value: name }
 
 // Whether an identifier is a wildcard — its value begins `*.`.
 pub fn is_wildcard(id: AcmeIdentifier) -> Bool []
-    todo("acme-nv.acmemsg.is_wildcard")
+    str.starts_with(id.value, "*.")
 
 // The base name of an identifier: `example.com` for `*.example.com`,
 // and itself otherwise.
@@ -304,7 +402,10 @@ pub fn is_wildcard(id: AcmeIdentifier) -> Bool []
 // authorization for a wildcard carries the base name and a `wildcard`
 // flag rather than the identifier the order asked for.
 pub fn base_name(id: AcmeIdentifier) -> Str []
-    todo("acme-nv.acmemsg.base_name")
+    if str.starts_with(id.value, "*.")
+        str.slice(id.value, 2, str.len(id.value))
+    else
+        id.value
 
 // The identifier in an order that this authorization answers.
 //
@@ -312,19 +413,33 @@ pub fn base_name(id: AcmeIdentifier) -> Str []
 // the match is on the base name AND the wildcard flag, never on the
 // identifier strings.
 pub fn identifier_for(order: AcmeOrder, authz: AcmeAuthorization) -> ?AcmeIdentifier []
-    todo("acme-nv.acmemsg.identifier_for")
+    for id in order.identifiers
+        if is_wildcard(id) == authz.wildcard and base_name(id) == authz.identifier.value
+            return Some(id)
+    None
 
 // The challenge of a kind in an authorization, or `None`.
 pub fn challenge_by_kind(authz: AcmeAuthorization, kind: AcmeChallengeKind) -> ?AcmeChallenge []
-    todo("acme-nv.acmemsg.challenge_by_kind")
+    for c in authz.challenges
+        if challenge_kind_name(c.kind) == challenge_kind_name(kind)
+            return Some(c)
+    None
 
 // The challenge kind a wire name denotes.
 pub fn challenge_kind_of_name(name: Str) -> AcmeChallengeKind []
-    todo("acme-nv.acmemsg.challenge_kind_of_name")
+    match name
+        "http-01"     => AcmeHttp01
+        "dns-01"      => AcmeDns01
+        "tls-alpn-01" => AcmeTlsAlpn01
+        _             => AcmeUnknownChallenge(name)
 
 // The wire name for a challenge kind.
 pub fn challenge_kind_name(kind: AcmeChallengeKind) -> Str []
-    todo("acme-nv.acmemsg.challenge_kind_name")
+    match kind
+        AcmeHttp01              => "http-01"
+        AcmeDns01               => "dns-01"
+        AcmeTlsAlpn01           => "tls-alpn-01"
+        AcmeUnknownChallenge(n) => n
 
 // Whether an order will not change again without a new request.
 //
@@ -332,15 +447,23 @@ pub fn challenge_kind_name(kind: AcmeChallengeKind) -> Str []
 // `valid` spins on a refused order until its own deadline and then
 // reports a timeout instead of the reason.
 pub fn is_terminal_order(s: AcmeOrderStatus) -> Bool []
-    todo("acme-nv.acmemsg.is_terminal_order")
+    match s
+        AcmeOrderValid   => true
+        AcmeOrderInvalid => true
+        _                => false
 
 // Whether an authorization will not change again.
 pub fn is_terminal_authz(s: AcmeAuthzStatus) -> Bool []
-    todo("acme-nv.acmemsg.is_terminal_authz")
+    match s
+        AcmeAuthzPending => false
+        _                => true
 
 // Whether a challenge will not change again.
 pub fn is_terminal_challenge(s: AcmeChallengeStatus) -> Bool []
-    todo("acme-nv.acmemsg.is_terminal_challenge")
+    match s
+        AcmeChallengeValid   => true
+        AcmeChallengeInvalid => true
+        _                    => false
 
 // Whether a problem means "retry this exact request with a new nonce".
 //
@@ -349,14 +472,14 @@ pub fn is_terminal_challenge(s: AcmeChallengeStatus) -> Bool []
 // under load hands them out routinely.  A client that reported it
 // fails intermittently in a way that looks like the network.
 pub fn problem_is_bad_nonce(p: AcmeProblem) -> Bool []
-    todo("acme-nv.acmemsg.problem_is_bad_nonce")
+    p.kind == ERROR_PREFIX + "badNonce"
 
 // Whether a problem means "you are asking too often".
 //
 // The `Retry-After` header beside it is the wait, and a client that
 // retried without honouring it makes its own rate limit worse.
 pub fn problem_is_rate_limit(p: AcmeProblem) -> Bool []
-    todo("acme-nv.acmemsg.problem_is_rate_limit")
+    p.kind == ERROR_PREFIX + "rateLimited"
 
 // Whether a problem means the challenge did not validate.
 //
@@ -364,17 +487,22 @@ pub fn problem_is_rate_limit(p: AcmeProblem) -> Bool []
 // that says what the server saw when it looked — the one piece of text
 // an operator can act on.
 pub fn problem_is_challenge_failure(p: AcmeProblem) -> Bool []
-    todo("acme-nv.acmemsg.problem_is_challenge_failure")
+    p.kind == ERROR_PREFIX + "unauthorized" or p.kind == ERROR_PREFIX + "incorrectResponse"
 
 // The problem URN, or `""` when there is none.
 pub fn problem_kind(p: AcmeProblem) -> Str []
-    todo("acme-nv.acmemsg.problem_kind")
+    p.kind
 
 // A one-line rendering of a problem for a person: the detail if there
 // is one, the title if not, and the URN's last segment when there is
 // neither.
 pub fn problem_text(p: AcmeProblem) -> Str []
-    todo("acme-nv.acmemsg.problem_text")
+    if p.detail != ""
+        p.detail
+    else if p.title != ""
+        p.title
+    else
+        last_segment(p.kind)
 
 // What went wrong reading a message, in one line.
 //
@@ -389,4 +517,208 @@ pub fn problem_text(p: AcmeProblem) -> Str []
 // ```
 impl Error for AcmeMsgFault
     fn message(self) -> Str
-        todo("acme-nv.acmemsg.AcmeMsgFault.message")
+        match self
+            AcmeMsgNotJson              => "the body is not a JSON object"
+            AcmeMsgFieldMissing(f)      => "the member `${f}` is missing"
+            AcmeMsgFieldWrongKind(f, w) => "the member `${f}` is not ${w}"
+            AcmeMsgUnknownStatus(f, v)  => "the member `${f}` holds the status `${v}`, which RFC 8555 does not define"
+            AcmeMsgNoIdentifiers        => "the identifier list is empty"
+            AcmeMsgTooMany(w, n, l)     => "${n} ${w} exceeds the limit of ${l}"
+
+// ── Reading a document ───────────────────────────────────────────────
+
+// A body parsed to a JSON object, held to the caller's size limit.
+fn parse_object(body: Str, limits: AcmeMsgLimits) -> Result<JsonValueH, AcmeMsgFault> []
+    if str.len(body) > limits.max_body_bytes
+        Err(AcmeMsgTooMany("body bytes", str.len(body), limits.max_body_bytes))
+    else
+        match json.parse(body)
+            None    => Err(AcmeMsgNotJson)
+            Some(v) =>
+                if json.type_of(v) == "object"
+                    Ok(v)
+                else
+                    Err(AcmeMsgFieldWrongKind("body", "a JSON object"))
+
+// A member that is present and not null.
+fn present(v: JsonValueH, key: Str) -> ?JsonValueH []
+    match json.get(v, key)
+        None    => None
+        Some(m) =>
+            if json.is_null(m)
+                None
+            else
+                Some(m)
+
+fn req_str(v: JsonValueH, key: Str) -> Result<Str, AcmeMsgFault> []
+    match present(v, key)
+        None    => Err(AcmeMsgFieldMissing(key))
+        Some(m) =>
+            if json.type_of(m) == "string"
+                Ok(json.to_str(m) ?? "")
+            else
+                Err(AcmeMsgFieldWrongKind(key, "a string"))
+
+// A string member, or `""` when it is absent.
+fn opt_str(v: JsonValueH, key: Str) -> Result<Str, AcmeMsgFault> []
+    match present(v, key)
+        None    => Ok("")
+        Some(_) => req_str(v, key)
+
+fn opt_bool(v: JsonValueH, key: Str) -> Result<Bool, AcmeMsgFault> []
+    match present(v, key)
+        None    => Ok(false)
+        Some(m) =>
+            if json.type_of(m) == "boolean"
+                Ok(json.to_bool(m) ?? false)
+            else
+                Err(AcmeMsgFieldWrongKind(key, "a boolean"))
+
+fn opt_int(v: JsonValueH, key: Str) -> Result<Int, AcmeMsgFault> []
+    match present(v, key)
+        None    => Ok(0)
+        Some(m) =>
+            if json.type_of(m) == "number"
+                Ok(json.to_int(m) ?? 0)
+            else
+                Err(AcmeMsgFieldWrongKind(key, "a number"))
+
+// An array member held to a count limit.
+fn req_list(v: JsonValueH, key: Str, limit: Int) -> Result<[JsonValueH], AcmeMsgFault> []
+    match present(v, key)
+        None    => Err(AcmeMsgFieldMissing(key))
+        Some(m) =>
+            if json.type_of(m) != "array"
+                Err(AcmeMsgFieldWrongKind(key, "an array"))
+            else
+                let items = json.to_list(m) ?? []
+                if list.len(items) > limit
+                    Err(AcmeMsgTooMany(key, list.len(items), limit))
+                else
+                    Ok(items)
+
+fn strings_of(key: Str, items: [JsonValueH]) -> Result<[Str], AcmeMsgFault> []
+    var out: [Str] = []
+    for item in items
+        if json.type_of(item) == "string"
+            list.push(out, json.to_str(item) ?? "")
+        else
+            return Err(AcmeMsgFieldWrongKind(key, "an array of strings"))
+    Ok(out)
+
+fn req_str_list(v: JsonValueH, key: Str, limit: Int) -> Result<[Str], AcmeMsgFault> []
+    let items = req_list(v, key, limit)!
+    strings_of(key, items)
+
+// An array of strings, or the empty list when the member is absent.
+fn opt_str_list(v: JsonValueH, key: Str, limit: Int) -> Result<[Str], AcmeMsgFault> []
+    match present(v, key)
+        None    => Ok([])
+        Some(_) => req_str_list(v, key, limit)
+
+fn account_status(name: Str) -> Result<AcmeAccountStatus, AcmeMsgFault> []
+    match name
+        "valid"       => Ok(AcmeAccountValid)
+        "deactivated" => Ok(AcmeAccountDeactivated)
+        "revoked"     => Ok(AcmeAccountRevoked)
+        _             => Err(AcmeMsgUnknownStatus("status", name))
+
+fn order_status(name: Str) -> Result<AcmeOrderStatus, AcmeMsgFault> []
+    match name
+        "pending"    => Ok(AcmeOrderPending)
+        "ready"      => Ok(AcmeOrderReady)
+        "processing" => Ok(AcmeOrderProcessing)
+        "valid"      => Ok(AcmeOrderValid)
+        "invalid"    => Ok(AcmeOrderInvalid)
+        _            => Err(AcmeMsgUnknownStatus("status", name))
+
+fn authz_status(name: Str) -> Result<AcmeAuthzStatus, AcmeMsgFault> []
+    match name
+        "pending"     => Ok(AcmeAuthzPending)
+        "valid"       => Ok(AcmeAuthzValid)
+        "invalid"     => Ok(AcmeAuthzInvalid)
+        "deactivated" => Ok(AcmeAuthzDeactivated)
+        "expired"     => Ok(AcmeAuthzExpired)
+        "revoked"     => Ok(AcmeAuthzRevoked)
+        _             => Err(AcmeMsgUnknownStatus("status", name))
+
+fn challenge_status(name: Str) -> Result<AcmeChallengeStatus, AcmeMsgFault> []
+    match name
+        "pending"    => Ok(AcmeChallengePending)
+        "processing" => Ok(AcmeChallengeProcessing)
+        "valid"      => Ok(AcmeChallengeValid)
+        "invalid"    => Ok(AcmeChallengeInvalid)
+        _            => Err(AcmeMsgUnknownStatus("status", name))
+
+fn identifier_of_value(v: JsonValueH) -> Result<AcmeIdentifier, AcmeMsgFault> []
+    if json.type_of(v) != "object"
+        Err(AcmeMsgFieldWrongKind("identifier", "an object"))
+    else
+        let kind_name = req_str(v, "type")!
+        let value = req_str(v, "value")!
+        let kind = match kind_name
+            "dns" => AcmeDnsIdentifier
+            "ip"  => AcmeIpIdentifier
+            _     => AcmeUnknownIdentifier(kind_name)
+        Ok(AcmeIdentifier { kind: kind, value: value })
+
+fn parse_identifiers(v: JsonValueH, key: Str,
+                     limit: Int) -> Result<[AcmeIdentifier], AcmeMsgFault> []
+    let items = req_list(v, key, limit)!
+    var out: [AcmeIdentifier] = []
+    for item in items
+        list.push(out, identifier_of_value(item)!)
+    Ok(out)
+
+fn identifier_kind_name(kind: AcmeIdentifierKind) -> Str []
+    match kind
+        AcmeDnsIdentifier        => "dns"
+        AcmeIpIdentifier         => "ip"
+        AcmeUnknownIdentifier(n) => n
+
+fn identifier_value(id: AcmeIdentifier) -> JsonValueH []
+    json.object([("type", json.string(identifier_kind_name(id.kind))),
+                 ("value", json.string(id.value))])
+
+fn challenge_of_value(v: JsonValueH,
+                      limits: AcmeMsgLimits) -> Result<AcmeChallenge, AcmeMsgFault> []
+    if json.type_of(v) != "object"
+        Err(AcmeMsgFieldWrongKind("challenge", "an object"))
+    else
+        let kind = challenge_kind_of_name(req_str(v, "type")!)
+        let status = challenge_status(req_str(v, "status")!)!
+        var problem: ?AcmeProblem = None
+        match present(v, "error")
+            None    =>
+                problem = None
+            Some(e) =>
+                problem = Some(problem_of_value(e, limits, 0)!)
+        Ok(AcmeChallenge { url: req_str(v, "url")!, kind: kind, status: status,
+                           token: opt_str(v, "token")!, validated: opt_str(v, "validated")!,
+                           problem: problem })
+
+// A problem document.  A subproblem is read the same way, one level
+// down; RFC 8555 section 6.7.1 nests no deeper, and a hostile server
+// that tried to is not followed.
+fn problem_of_value(v: JsonValueH, limits: AcmeMsgLimits,
+                    depth: Int) -> Result<AcmeProblem, AcmeMsgFault> []
+    if json.type_of(v) != "object"
+        Err(AcmeMsgFieldWrongKind("error", "an object"))
+    else
+        var subs: [AcmeProblem] = []
+        if depth == 0
+            match present(v, "subproblems")
+                None    =>
+                    subs = []
+                Some(_) =>
+                    for item in req_list(v, "subproblems", limits.max_subproblems)!
+                        list.push(subs, problem_of_value(item, limits, 1)!)
+        Ok(AcmeProblem { kind: opt_str(v, "type")!, title: opt_str(v, "title")!,
+                         detail: opt_str(v, "detail")!, status: opt_int(v, "status")!,
+                         subproblems: subs })
+
+// The text after the last colon of a URN, or the whole text when it
+// has none.
+fn last_segment(urn: Str) -> Str []
+    let parts = str.split(urn, ":")
+    parts[list.len(parts) - 1]
