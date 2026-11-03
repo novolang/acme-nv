@@ -29,7 +29,7 @@ category    = "crypto"
 tags        = ["acme", "rfc8555", "certificates", "letsencrypt", "http-01", "dns-01", "jws"]
 repository  = "https://github.com/novolang/acme-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.22.0"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

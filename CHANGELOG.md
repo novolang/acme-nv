@@ -53,6 +53,8 @@ reason.
   suite, and `tests/coverage.sh`, which merges the line coverage of the
   suites over `src/`.
 
+This release requires novo 0.23.0 or later.
+
 ## 0.0.2 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.
